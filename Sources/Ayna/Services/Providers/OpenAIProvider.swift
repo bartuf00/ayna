@@ -86,7 +86,6 @@ final class OpenAIProvider: AIProviderProtocol, @unchecked Sendable {
                 tools: toolDefinitions,
                 apiKey: config.apiKey,
                 isAzure: usesAzureEndpoint,
-                isGitHubModels: false,
                 supportsParallelToolCalls: supportsParallelToolCalls
             ) else {
                 guard !Task.isCancelled else { return }
@@ -102,7 +101,6 @@ final class OpenAIProvider: AIProviderProtocol, @unchecked Sendable {
 
             guard !Task.isCancelled else { return }
             self.currentRequestBuildTask = nil
-
             DiagnosticsLogger.log(
                 .aiService,
                 level: .info,

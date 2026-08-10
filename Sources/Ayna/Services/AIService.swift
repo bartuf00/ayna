@@ -17,7 +17,6 @@ import os
 
 enum AIProvider: String, CaseIterable, Codable {
     case openai = "OpenAI"
-    case githubModels = "GitHub Models"
     case appleIntelligence = "Apple Intelligence"
     case anthropic = "Anthropic"
 
@@ -91,7 +90,6 @@ enum RequestFlightCheckpoint: Sendable {
     case dataCallback
     case dataRetry
     case anthropicTerminal
-    case multiModelPermitQueued
     case multiModelStart
     case multiModelCallback
 }
@@ -304,16 +302,6 @@ typealias AIServiceResponseSimulator = @MainActor @Sendable (
     AIServiceResponseSimulationCallbacks
 ) -> Void
 
-private enum MultiModelCredentialSource: Sendable {
-    case githubOAuth
-    case storedModelKey(oauthTokenAtPreparation: String?)
-}
-
-private struct MultiModelPreparedCredential: Sendable {
-    let value: String
-    let source: MultiModelCredentialSource
-}
-
 @MainActor
 class AIService: ObservableObject {
     static let shared = AIService()
@@ -368,6 +356,8 @@ class AIService: ObservableObject {
 
     @Published var provider: AIProvider {
         didSet {
+            unrecognizedDefaultProviderValue = nil
+            modelsInheritingUnrecognizedDefaultProvider.removeAll()
             #if !os(watchOS)
                 AppPreferences.storage.set(provider.rawValue, forKey: "aiProvider")
             #endif
@@ -383,6 +373,9 @@ class AIService: ObservableObject {
     private let retryDelay: @Sendable (Int, Date?) async -> Void
     private let requestFlightObserver: RequestFlightObserver
     private let responseSimulator: AIServiceResponseSimulator?
+    private var unrecognizedProviderValues: [String: String] = [:]
+    private var unrecognizedDefaultProviderValue: String?
+    private var modelsInheritingUnrecognizedDefaultProvider: Set<String> = []
     #if !os(watchOS)
         private let injectedAppleIntelligenceService: (any AppleIntelligenceServing)?
     #endif
@@ -400,8 +393,14 @@ class AIService: ObservableObject {
 
     @Published var customModels: [String] {
         didSet {
+            let retainedModels = Set(customModels)
+            unrecognizedProviderValues = unrecognizedProviderValues.filter {
+                retainedModels.contains($0.key)
+            }
+            modelsInheritingUnrecognizedDefaultProvider.formIntersection(retainedModels)
             #if !os(watchOS)
                 AppPreferences.storage.set(customModels, forKey: "customModels")
+                persistModelProviders()
                 // iCloud sync disabled for free developer account
                 // NSUbiquitousKeyValueStore.default.set(customModels, forKey: "customModels")
                 // NSUbiquitousKeyValueStore.default.synchronize()
@@ -411,9 +410,12 @@ class AIService: ObservableObject {
 
     @Published var modelProviders: [String: AIProvider] {
         didSet {
+            for model in modelProviders.keys {
+                unrecognizedProviderValues.removeValue(forKey: model)
+                modelsInheritingUnrecognizedDefaultProvider.remove(model)
+            }
             #if !os(watchOS)
-                let encodedDict = modelProviders.mapValues { $0.rawValue }
-                AppPreferences.storage.set(encodedDict, forKey: "modelProviders")
+                persistModelProviders()
                 // iCloud sync disabled for free developer account
                 // NSUbiquitousKeyValueStore.default.set(encodedDict, forKey: "modelProviders")
                 // NSUbiquitousKeyValueStore.default.synchronize()
@@ -448,16 +450,6 @@ class AIService: ObservableObject {
         didSet {
             #if !os(watchOS)
                 persistModelAPIKeys()
-            #endif
-        }
-    }
-
-    /// Tracks which models use GitHub OAuth
-    @Published var modelUsesGitHubOAuth: [String: Bool] {
-        didSet {
-            #if !os(watchOS)
-                let dict = modelUsesGitHubOAuth.mapValues { $0 as NSNumber }
-                AppPreferences.storage.set(dict, forKey: "modelUsesGitHubOAuth")
             #endif
         }
     }
@@ -553,12 +545,25 @@ class AIService: ObservableObject {
             ProcessInfo.processInfo.arguments.contains("-AYNA_UI_TESTING") ||
             UserDefaults.standard.bool(forKey: "AYNA_UI_TESTING")
 
-        // Load custom models first
-        var loadedCustomModels: [String] = if let savedModels = AppPreferences.storage.array(forKey: "customModels") as? [String] {
-            savedModels
-        } else {
-            []
+        let savedProviderValues = AppPreferences.storage.dictionary(forKey: "modelProviders") as? [String: String]
+        let savedDefaultProviderValue = AppPreferences.storage.string(forKey: "aiProvider")
+        let savedCustomModels = AppPreferences.storage.array(forKey: "customModels") as? [String] ?? []
+        let savedEndpointTypeValues = AppPreferences.storage.dictionary(forKey: "modelEndpointTypes") as? [String: String]
+        let savedEndpointValues = AppPreferences.storage.dictionary(forKey: "modelEndpoints") as? [String: String]
+
+        unrecognizedProviderValues = savedProviderValues?.filter {
+            AIProvider(rawValue: $0.value) == nil
+        } ?? [:]
+        if let savedDefaultProviderValue,
+           AIProvider(rawValue: savedDefaultProviderValue) == nil
+        {
+            unrecognizedDefaultProviderValue = savedDefaultProviderValue
+            modelsInheritingUnrecognizedDefaultProvider = Set(savedCustomModels.filter {
+                savedProviderValues?[$0] == nil
+            })
         }
+
+        var loadedCustomModels = savedCustomModels
 
         // Ensure test model exists during UI testing
         let testModelName = "ui-test-model"
@@ -569,16 +574,14 @@ class AIService: ObservableObject {
 
         // Load model providers mapping
         let loadedProviders: [String: AIProvider]
-        if let savedProviders = AppPreferences.storage.dictionary(forKey: "modelProviders")
-            as? [String: String]
-        {
+        if let savedProviders = savedProviderValues {
             let mapped = savedProviders.compactMapValues { AIProvider(rawValue: $0) }
             let droppedProviders = savedProviders.keys.filter { mapped[$0] == nil }
             if !droppedProviders.isEmpty {
                 DiagnosticsLogger.log(
                     .aiService,
                     level: .error,
-                    message: "Dropped unrecognized provider mappings during load — models may appear reset",
+                    message: "Ignored unrecognized provider mappings during load — models may appear reset",
                     metadata: ["droppedModels": droppedProviders.joined(separator: ", "),
                                "rawValues": droppedProviders.compactMap { savedProviders[$0] }.joined(separator: ", ")]
                 )
@@ -600,9 +603,7 @@ class AIService: ObservableObject {
 
         // Load model endpoint types mapping
         let loadedEndpointTypes: [String: APIEndpointType]
-        if let savedEndpointTypes = AppPreferences.storage.dictionary(forKey: "modelEndpointTypes")
-            as? [String: String]
-        {
+        if let savedEndpointTypes = savedEndpointTypeValues {
             let mapped = savedEndpointTypes.compactMapValues { APIEndpointType(rawValue: $0) }
             let droppedTypes = savedEndpointTypes.keys.filter { mapped[$0] == nil }
             if !droppedTypes.isEmpty {
@@ -630,13 +631,7 @@ class AIService: ObservableObject {
         modelEndpointTypes = updatedEndpointTypes
 
         // Load custom endpoints mapping
-        let loadedEndpoints: [String: String] = if let savedEndpoints = AppPreferences.storage.dictionary(forKey: "modelEndpoints")
-            as? [String: String]
-        {
-            savedEndpoints
-        } else {
-            [:]
-        }
+        let loadedEndpoints = savedEndpointValues ?? [:]
         modelEndpoints = loadedEndpoints
 
         // Load per-model API keys
@@ -650,28 +645,29 @@ class AIService: ObservableObject {
         modelAPIKeys = mutableAPIKeys
         keychainLoadSucceeded = loadSuccess
 
-        // Load GitHub OAuth flags for models
-        if let savedOAuthFlags = AppPreferences.storage.dictionary(forKey: "modelUsesGitHubOAuth") as? [String: NSNumber] {
-            modelUsesGitHubOAuth = savedOAuthFlags.mapValues { $0.boolValue }
-        } else {
-            modelUsesGitHubOAuth = [:]
-        }
-
         // Load selected model, ensure it exists in custom models
         let savedSelectedModel = AppPreferences.storage.string(forKey: "selectedModel") ?? ""
+        let defaultProviderIsRecognized = savedDefaultProviderValue.map { AIProvider(rawValue: $0) != nil } ?? true
+        let supportedCustomModels = savedCustomModels.filter { model in
+            if let rawValue = savedProviderValues?[model] {
+                return AIProvider(rawValue: rawValue) != nil
+            }
+            return defaultProviderIsRecognized
+        }
+        let cleanedSelectedModel = if supportedCustomModels.contains(savedSelectedModel) {
+            savedSelectedModel
+        } else {
+            supportedCustomModels.first ?? ""
+        }
         if isUITesting {
             // Always use test model for UI tests
             selectedModel = testModelName
-        } else if loadedCustomModels.contains(savedSelectedModel) {
-            selectedModel = savedSelectedModel
-        } else if let firstModel = loadedCustomModels.first {
-            selectedModel = firstModel
         } else {
-            selectedModel = ""
+            selectedModel = cleanedSelectedModel
         }
 
         // Initialize provider
-        if let providerString = AppPreferences.storage.string(forKey: "aiProvider"),
+        if let providerString = savedDefaultProviderValue,
            let savedProvider = AIProvider(rawValue: providerString)
         {
             provider = savedProvider
@@ -711,6 +707,16 @@ class AIService: ObservableObject {
                 permissionService: permService,
                 projectRoot: url
             )
+        }
+    #endif
+
+    #if !os(watchOS)
+        private func persistModelProviders() {
+            var encodedProviders = modelProviders.mapValues(\.rawValue)
+            for (model, rawValue) in unrecognizedProviderValues where customModels.contains(model) {
+                encodedProviders[model] = rawValue
+            }
+            AppPreferences.storage.set(encodedProviders, forKey: "modelProviders")
         }
     #endif
 
@@ -820,131 +826,30 @@ class AIService: ObservableObject {
         OpenAIEndpointResolver.isAzureEndpoint(endpoint)
     }
 
-    /// Get API key for a specific model.
-    /// For GitHub Models with OAuth, returns the OAuth token.
-    /// Returns empty string if no key is configured for the model.
+    /// Get the API key configured for a specific model.
     func getAPIKey(for model: String?) -> String {
         guard let model else { return "" }
-
-        // Check if this model uses GitHub OAuth
-        let usesOAuth = modelUsesGitHubOAuth[model] == true
-        let isGitHubModel = modelProviders[model] == .githubModels
-
-        DiagnosticsLogger.log(
-            .aiService,
-            level: .debug,
-            message: "🔑 Getting API key for model",
-            metadata: [
-                "model": model,
-                "isGitHubModel": "\(isGitHubModel)",
-                "usesOAuth": "\(usesOAuth)",
-                "isAuthenticated": "\(GitHubOAuthService.shared.isAuthenticated)"
-            ]
-        )
-
-        // For GitHub Models, always try OAuth token first if authenticated
-        if isGitHubModel {
-            if GitHubOAuthService.shared.isAuthenticated,
-               let token = GitHubOAuthService.shared.getAccessToken(),
-               !token.isEmpty
-            {
-                DiagnosticsLogger.log(
-                    .aiService,
-                    level: .debug,
-                    message: "🔑 Using GitHub OAuth token",
-                    metadata: ["tokenPrefix": String(token.prefix(10)) + "..."]
-                )
-                return token
-            } else {
-                DiagnosticsLogger.log(
-                    .aiService,
-                    level: .info,
-                    message: "⚠️ GitHub OAuth not available, using stored API key"
-                )
-            }
-        }
-
         return modelAPIKeys[model] ?? ""
     }
 
-    /// Async version of getAPIKey that ensures the token is valid before returning.
-    /// For GitHub Models with OAuth, this will refresh the token if it's expiring soon.
-    /// Use this for critical API requests where you can await.
-    /// Returns empty string if no key is configured for the model.
-    func getValidAPIKey(for model: String?) async throws -> String {
-        guard let model else { return "" }
-
-        let isGitHubModel = modelProviders[model] == .githubModels
-
-        // For GitHub Models, use the async method that handles refresh deduplication
-        if isGitHubModel, GitHubOAuthService.shared.isAuthenticated {
-            do {
-                let token = try await GitHubOAuthService.shared.getValidAccessToken()
-                DiagnosticsLogger.log(
-                    .aiService,
-                    level: .debug,
-                    message: "🔑 Using validated GitHub OAuth token",
-                    metadata: ["tokenPrefix": String(token.prefix(10)) + "..."]
-                )
-                return token
-            } catch {
-                DiagnosticsLogger.log(
-                    .aiService,
-                    level: .error,
-                    message: "❌ Failed to get valid GitHub token: \(error.localizedDescription)"
-                )
-                // Fall back to stored API key
-            }
+    private func unrecognizedProviderName(for model: String) -> String? {
+        if let rawValue = unrecognizedProviderValues[model] {
+            return rawValue
         }
-
-        return modelAPIKeys[model] ?? ""
+        guard modelsInheritingUnrecognizedDefaultProvider.contains(model) else {
+            return nil
+        }
+        return unrecognizedDefaultProviderValue
     }
 
-    private func prepareGitHubCredential(for model: String) async throws -> MultiModelPreparedCredential {
-        if GitHubOAuthService.shared.isAuthenticated {
-            do {
-                let accessToken = try await GitHubOAuthService.shared.getValidAccessToken()
-                guard !accessToken.isEmpty else {
-                    throw AynaError.missingAPIKey(provider: AIProvider.githubModels.displayName)
-                }
-                return MultiModelPreparedCredential(value: accessToken, source: .githubOAuth)
-            } catch {
-                if let storedKey = modelAPIKeys[model], !storedKey.isEmpty {
-                    return MultiModelPreparedCredential(
-                        value: storedKey,
-                        source: .storedModelKey(
-                            oauthTokenAtPreparation: GitHubOAuthService.shared.getAccessToken()
-                        )
-                    )
-                }
-                throw error
-            }
+    private func resolvedProvider(for model: String) throws -> AIProvider {
+        if let providerName = unrecognizedProviderName(for: model) {
+            throw AynaError.unsupportedProvider(
+                provider: providerName,
+                operation: "Using model '\(model)'"
+            )
         }
-
-        guard let storedKey = modelAPIKeys[model], !storedKey.isEmpty else {
-            throw AynaError.missingAPIKey(provider: AIProvider.githubModels.displayName)
-        }
-        return MultiModelPreparedCredential(
-            value: storedKey,
-            source: .storedModelKey(oauthTokenAtPreparation: nil)
-        )
-    }
-
-    private func isCurrentGitHubCredential(
-        _ credential: MultiModelPreparedCredential,
-        model: String
-    ) -> Bool {
-        switch credential.source {
-        case .githubOAuth:
-            return GitHubOAuthService.shared.isAuthenticated &&
-                GitHubOAuthService.shared.isCurrentAccessTokenValid(credential.value)
-        case let .storedModelKey(oauthTokenAtPreparation):
-            let currentOAuthToken = GitHubOAuthService.shared.isAuthenticated
-                ? GitHubOAuthService.shared.getAccessToken()
-                : nil
-            return modelAPIKeys[model] == credential.value &&
-                currentOAuthToken == oauthTokenAtPreparation
-        }
+        return modelProviders[model] ?? provider
     }
 
     private func getAPIURL(deploymentName: String? = nil, provider: AIProvider? = nil) throws -> String {
@@ -1088,7 +993,7 @@ class AIService: ObservableObject {
     fileprivate func cancelTextBatchRequest(_ flightID: RequestFlightID) {
         guard let batchTask = multiModelTask.take(ifOwnedBy: flightID) else { return }
 
-        // Fence queued runners before cancelling children that may release shared permits.
+        // Fence pending runners before cancelling active child requests.
         batchTask.cancel()
         cancelTextRequest(flightID)
     }
@@ -1163,7 +1068,7 @@ class AIService: ObservableObject {
             }
         #endif
 
-        // Fence queued multi-model starts before active handles can release shared permits.
+        // Fence pending multi-model starts before cancelling active handles.
         multiModelBatchTask?.cancel()
         dataTask?.cancel()
         for (model, task) in multiDataTasks {
@@ -1230,7 +1135,13 @@ class AIService: ObservableObject {
                 return nil
             }
 
-            let effectiveProvider = modelProviders[requestModel] ?? provider
+            let effectiveProvider: AIProvider
+            do {
+                effectiveProvider = try resolvedProvider(for: requestModel)
+            } catch {
+                onError(error)
+                return nil
+            }
             let endpointInfo = customEndpoint(for: requestModel)
 
             let requestConfig = OpenAIImageService.RequestConfig(
@@ -1298,7 +1209,13 @@ class AIService: ObservableObject {
                 return nil
             }
 
-            let effectiveProvider = modelProviders[requestModel] ?? provider
+            let effectiveProvider: AIProvider
+            do {
+                effectiveProvider = try resolvedProvider(for: requestModel)
+            } catch {
+                onError(error)
+                return nil
+            }
             let endpointInfo = customEndpoint(for: requestModel)
 
             let requestConfig = OpenAIImageService.RequestConfig(
@@ -1376,31 +1293,6 @@ class AIService: ObservableObject {
         }
     }
 
-    /// Checks if GitHub Models rate limit is currently blocking requests for the given access token.
-    /// Returns an error message if rate-limited, nil if requests can proceed.
-    private func checkGitHubModelsRateLimit(accessToken: String) -> String? {
-        guard !accessToken.isEmpty else { return nil }
-        let oauthService = GitHubOAuthService.shared
-
-        // Check if we have an active retry-after from a previous 429/403
-        if let retryAfter = oauthService.retryAfterDate(forAccessToken: accessToken), retryAfter > Date() {
-            let secondsRemaining = Int(retryAfter.timeIntervalSinceNow)
-            if secondsRemaining > 60 {
-                let minutesRemaining = secondsRemaining / 60
-                return "Rate limited. Please wait \(minutesRemaining) minute\(minutesRemaining == 1 ? "" : "s")."
-            } else if secondsRemaining > 0 {
-                return "Rate limited. Please wait \(secondsRemaining) second\(secondsRemaining == 1 ? "" : "s")."
-            }
-        }
-
-        // Check if rate limit is exhausted
-        if let rateLimitInfo = oauthService.rateLimitInfo(forAccessToken: accessToken), rateLimitInfo.isExhausted {
-            return "Rate limit exhausted. Resets \(rateLimitInfo.formattedReset)."
-        }
-
-        return nil
-    }
-
     @discardableResult
     func sendMessage( // swiftlint:disable:this function_body_length
         messages: [Message],
@@ -1417,7 +1309,6 @@ class AIService: ObservableObject {
         onToolCall: (@Sendable (String, String, [String: Any]) async -> String)? = nil,
         onToolCallRequested: (@Sendable (String, String, [String: Any]) -> Void)? = nil,
         onReasoning: (@Sendable (String) -> Void)? = nil,
-        preparedAPIKey: String? = nil,
         requestFlightID: RequestFlightID? = nil
     ) -> AITextRequest {
         let flightID = requestFlightID ?? RequestFlightID()
@@ -1489,7 +1380,13 @@ class AIService: ObservableObject {
             onError(AIError.missingModel)
             return requestHandle
         }
-        let effectiveProvider = modelProviders[requestModel] ?? provider
+        let effectiveProvider: AIProvider
+        do {
+            effectiveProvider = try resolvedProvider(for: requestModel)
+        } catch {
+            onError(error)
+            return requestHandle
+        }
         let endpointInfo = customEndpoint(for: requestModel)
         let usesAzureEndpoint = endpointInfo.map { isAzureEndpoint($0.endpoint) } ?? false
 
@@ -1580,23 +1477,11 @@ class AIService: ObservableObject {
             return requestHandle
         }
 
-        let modelAPIKey = preparedAPIKey ?? getAPIKey(for: requestModel)
+        let modelAPIKey = getAPIKey(for: requestModel)
 
-        // Check GitHub Models rate limit before making request
-        if effectiveProvider == .githubModels {
-            if let rateLimitError = checkGitHubModelsRateLimit(accessToken: modelAPIKey) {
-                onError(AIError.apiError(rateLimitError))
-                return requestHandle
-            }
-        }
-
-        // Check if this model should use the responses API (not supported for GitHub Models)
+        // Check if this model should use the Responses API.
         let endpointType = modelEndpointTypes[requestModel] ?? .chatCompletions
         if endpointType == .responses {
-            if effectiveProvider == .githubModels {
-                onError(AIError.apiError("GitHub Models does not support the Responses API endpoint"))
-                return requestHandle
-            }
             responsesAPIRequest(
                 messages: messages,
                 model: requestModel,
@@ -1633,8 +1518,7 @@ class AIService: ObservableObject {
             return requestHandle
         }
 
-        let needsAuth = effectiveProvider == .openai || effectiveProvider == .githubModels
-        let isGitHubModels = effectiveProvider == .githubModels
+        let needsAuth = effectiveProvider == .openai
 
         DiagnosticsLogger.log(
             .aiService,
@@ -1643,8 +1527,7 @@ class AIService: ObservableObject {
             metadata: [
                 "url": apiURL,
                 "hasAPIKey": "\(!modelAPIKey.isEmpty)",
-                "needsAuth": "\(needsAuth)",
-                "isGitHubModels": "\(isGitHubModels)"
+                "needsAuth": "\(needsAuth)"
             ]
         )
 
@@ -1690,7 +1573,6 @@ class AIService: ObservableObject {
                 tools: toolDefinitions,
                 apiKey: needsAuth ? modelAPIKey : "",
                 isAzure: usesAzureEndpoint,
-                isGitHubModels: isGitHubModels,
                 supportsParallelToolCalls: supportsParallelToolCalls
             )
 
@@ -1821,6 +1703,16 @@ class AIService: ObservableObject {
             return requestHandle
         }
 
+        var requestProviders: [String: AIProvider] = [:]
+        do {
+            for model in requestModels {
+                requestProviders[model] = try resolvedProvider(for: model)
+            }
+        } catch {
+            rejectBatch(error)
+            return requestHandle
+        }
+
         DiagnosticsLogger.log(
             .aiService,
             level: .info,
@@ -1867,7 +1759,7 @@ class AIService: ObservableObject {
             multiModelAppleIntelligenceTasks.removeAll()
         #endif
 
-        // Cancel the batch first so queued runners are fenced before active request handles release permits.
+        // Cancel the batch first so pending runners are fenced before active request handles are cancelled.
         previousBatchTask?.cancel()
         previousDataTasks.forEach { $0.cancel() }
         previousRequestBuildTasks.forEach { $0.cancel() }
@@ -1885,7 +1777,7 @@ class AIService: ObservableObject {
             await withTaskGroup(of: Void.self) { group in
                 for (callbackModel, model) in modelRequests {
                     guard !Task.isCancelled, self.multiModelTask.owns(flightID) else { return }
-                    let effectiveProvider = self.modelProviders[model] ?? self.provider
+                    guard let effectiveProvider = requestProviders[model] else { continue }
                     let preparedEndpoint = self.modelEndpoints[model]
                     let preparedEndpointType = self.modelEndpointTypes[model]
                     let requestFlightObserver = self.requestFlightObserver
@@ -1902,41 +1794,13 @@ class AIService: ObservableObject {
                             return
                         }
 
-                        let preparedCredential: MultiModelPreparedCredential?
-                        if effectiveProvider == .githubModels {
-                            do {
-                                preparedCredential = try await self.prepareGitHubCredential(for: model)
-                            } catch {
-                                let message = error.localizedDescription
-                                await MainActor.run {
-                                    guard !Task.isCancelled, self.multiModelTask.owns(flightID) else { return }
-                                    onError(callbackModel, AIError.apiError(message))
-                                }
-                                return
-                            }
-                        } else {
-                            preparedCredential = nil
-                        }
-                        let preparedAPIKey = preparedCredential?.value
-
                         guard !Task.isCancelled else { return }
                         let stillOwnsBatch = await MainActor.run {
                             self.multiModelTask.owns(flightID)
                         }
                         guard stillOwnsBatch else { return }
 
-                        let gitHubPermit: MultiModelRequestRunner.GitHubPermit? = if let preparedAPIKey {
-                            MultiModelRequestRunner.GitHubPermit.shared(
-                                key: GitHubOAuthService.rateLimitKey(forAccessToken: preparedAPIKey),
-                                onQueued: {
-                                    requestFlightObserver.record(.multiModelPermitQueued, true)
-                                }
-                            )
-                        } else {
-                            nil
-                        }
-
-                        await MultiModelRequestRunner.run(gitHubPermit: gitHubPermit) { [weak self] completion in
+                        await MultiModelRequestRunner.run { [weak self] completion in
                             guard let self,
                                   !Task.isCancelled,
                                   self.multiModelTask.owns(flightID)
@@ -1985,14 +1849,10 @@ class AIService: ObservableObject {
                                 }
                             }
 
-                            let currentProvider = self.modelProviders[model] ?? self.provider
-                            let credentialIsCurrent = preparedCredential.map {
-                                self.isCurrentGitHubCredential($0, model: model)
-                            } ?? true
+                            let currentProvider = try? self.resolvedProvider(for: model)
                             guard currentProvider == effectiveProvider,
                                   self.modelEndpoints[model] == preparedEndpoint,
-                                  self.modelEndpointTypes[model] == preparedEndpointType,
-                                  credentialIsCurrent
+                                  self.modelEndpointTypes[model] == preparedEndpointType
                             else {
                                 callbackForwarder.enqueue(
                                     .error(
@@ -2005,14 +1865,6 @@ class AIService: ObservableObject {
                             }
 
                             requestFlightObserver.record(.multiModelStart, true)
-
-                            if effectiveProvider == .githubModels,
-                               let preparedAPIKey,
-                               let rateLimitError = self.checkGitHubModelsRateLimit(accessToken: preparedAPIKey)
-                            {
-                                callbackForwarder.enqueue(.error(AIError.apiError(rateLimitError)))
-                                return
-                            }
 
                             self.sendMessage(
                                 messages: messages,
@@ -2040,7 +1892,6 @@ class AIService: ObservableObject {
                                 onReasoning: { reasoning in
                                     callbackForwarder.enqueue(.reasoning(reasoning))
                                 },
-                                preparedAPIKey: preparedAPIKey,
                                 requestFlightID: flightID
                             )
                         }
@@ -2406,7 +2257,13 @@ class AIService: ObservableObject {
         }
 
         // Check if this model has a provider override
-        let effectiveProvider = modelProviders[model] ?? provider
+        let effectiveProvider: AIProvider
+        do {
+            effectiveProvider = try resolvedProvider(for: model)
+        } catch {
+            reportSetupError(error)
+            return
+        }
         let endpointInfo = customEndpoint(for: model)
         let usesAzureEndpoint = endpointInfo.map { isAzureEndpoint($0.endpoint) } ?? false
 
@@ -2732,9 +2589,6 @@ class AIService: ObservableObject {
         case 429:
             return "Too many requests. Please wait a minute before trying again."
         case 403:
-            if requestURL?.absoluteString.contains("models.github.ai") == true {
-                return "Rate limit exceeded. GitHub Models has usage limits. Please wait a few minutes."
-            }
             return "HTTP \(statusCode) - Forbidden. Check your API key permissions."
         case 500, 502, 503, 504:
             return "Server error (\(statusCode)). Please try again in a moment."
@@ -2773,7 +2627,7 @@ class AIService: ObservableObject {
             if let message = json["message"] as? String {
                 return message
             }
-            // GitHub Models style: {"error": "...", "error_description": "..."}
+            // OAuth-style error: {"error": "...", "error_description": "..."}
             if let errorDesc = json["error_description"] as? String {
                 return errorDesc
             }
@@ -2786,16 +2640,6 @@ class AIService: ObservableObject {
             return String(text.prefix(200))
         }
         return "HTTP \(statusCode)"
-    }
-
-    /// Check if error body indicates rate limiting (for 403 responses)
-    private nonisolated func isRateLimitErrorBody(_ data: Data) -> Bool {
-        guard let errorString = String(data: data, encoding: .utf8) else { return false }
-        let lowercased = errorString.lowercased()
-        return lowercased.contains("rate limit") ||
-            lowercased.contains("rate_limit") ||
-            lowercased.contains("too many requests") ||
-            lowercased.contains("ratelimit")
     }
 
     private func ownsStreamFlight(
@@ -3031,25 +2875,6 @@ class AIService: ObservableObject {
                             // Ignore errors reading error body
                         }
 
-                        // Capture rate limit headers for GitHub Models (even on error), scoped per token.
-                        let isGitHubModelsRequest = request.url?.host?.contains("models.github.ai") == true
-                        let accessToken = request.value(forHTTPHeaderField: "Authorization")
-                            .map { $0.replacingOccurrences(of: "Bearer ", with: "") }
-
-                        if isGitHubModelsRequest, let accessToken, !accessToken.isEmpty {
-                            await MainActor.run {
-                                GitHubOAuthService.shared.updateRateLimit(from: httpResponse, forAccessToken: accessToken)
-
-                                // Check if this is a rate limit error (429 or 403 with rate limit message)
-                                let statusCode = httpResponse.statusCode
-                                if statusCode == 429 ||
-                                    (statusCode == 403 && self.isRateLimitErrorBody(errorData))
-                                {
-                                    GitHubOAuthService.shared.updateRetryAfter(from: httpResponse, forAccessToken: accessToken)
-                                }
-                            }
-                        }
-
                         let errorMessage: String = if !errorData.isEmpty {
                             self.extractAPIErrorMessage(from: errorData, statusCode: httpResponse.statusCode)
                         } else {
@@ -3072,17 +2897,6 @@ class AIService: ObservableObject {
                             ]
                         )
                         throw AIError.apiError(errorMessage)
-                    }
-
-                    // Capture rate limit headers on success for GitHub Models (scoped per token).
-                    let isGitHubModelsRequest = request.url?.host?.contains("models.github.ai") == true
-                    let accessToken = request.value(forHTTPHeaderField: "Authorization")
-                        .map { $0.replacingOccurrences(of: "Bearer ", with: "") }
-                    if isGitHubModelsRequest, let accessToken, !accessToken.isEmpty {
-                        await MainActor.run {
-                            GitHubOAuthService.shared.updateRateLimit(from: httpResponse, forAccessToken: accessToken)
-                            GitHubOAuthService.shared.clearRetryAfter(forAccessToken: accessToken)
-                        }
                     }
 
                     var buffer = Data()
@@ -3507,27 +3321,13 @@ class AIService: ObservableObject {
         }
 
         if shouldRetry(error: error, attempt: attempt, hasReceivedData: hasReceivedData) {
-            // Get retry-after date for GitHub Models rate limits
-            let isGitHubModelsRequest = request.url?.host?.contains("models.github.ai") == true
-            let accessToken = request.value(forHTTPHeaderField: "Authorization")
-                .map { $0.replacingOccurrences(of: "Bearer ", with: "") }
-
-            let retryAfterDate: Date? = if isGitHubModelsRequest, let accessToken, !accessToken.isEmpty {
-                GitHubOAuthService.shared.retryAfterDate(forAccessToken: accessToken)
-            } else {
-                nil
-            }
-
             DiagnosticsLogger.log(
                 .aiService,
                 level: .info,
                 message: "⚠️ Retrying stream request (attempt \(attempt + 1))",
-                metadata: [
-                    "error": error.localizedDescription,
-                    "retryAfter": retryAfterDate?.description ?? "none"
-                ]
+                metadata: ["error": error.localizedDescription]
             )
-            await delay(for: attempt, retryAfterDate: retryAfterDate)
+            await delay(for: attempt, retryAfterDate: nil)
             let ownsFlight = ownsStreamFlight(
                 flightID,
                 requestLane: requestLane,
@@ -4820,7 +4620,7 @@ extension AIService {
         switch provider {
         case .appleIntelligence:
             false
-        case .openai, .githubModels, .anthropic:
+        case .openai, .anthropic:
             true
         }
     }
@@ -4837,6 +4637,9 @@ extension AIService {
     var requiresAPIKey: Bool {
         let trimmedModel = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedModel = trimmedModel.isEmpty ? nil : trimmedModel
+        if let normalizedModel, unrecognizedProviderName(for: normalizedModel) != nil {
+            return false
+        }
         let activeProvider = normalizedModel.flatMap { modelProviders[$0] } ?? provider
         return requiresAPIKey(for: activeProvider, model: normalizedModel)
     }
@@ -4847,16 +4650,6 @@ extension AIService {
 
     private func isAPIKeyConfigured(for provider: AIProvider, model: String?) -> Bool {
         guard requiresAPIKey(for: provider, model: model) else { return true }
-
-        // For GitHub Models, check OAuth token first
-        if provider == .githubModels {
-            if GitHubOAuthService.shared.isAuthenticated,
-               let token = GitHubOAuthService.shared.getAccessToken(),
-               !token.isEmpty
-            {
-                return true
-            }
-        }
 
         // Check for per-model key
         if let model,
@@ -4875,6 +4668,9 @@ extension AIService {
     var isAPIKeyConfigured: Bool {
         let trimmedModel = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedModel = trimmedModel.isEmpty ? nil : trimmedModel
+        if let normalizedModel, unrecognizedProviderName(for: normalizedModel) != nil {
+            return false
+        }
         let activeProvider = normalizedModel.flatMap { modelProviders[$0] } ?? provider
         return isAPIKeyConfigured(for: activeProvider, model: normalizedModel)
     }
@@ -4883,6 +4679,7 @@ extension AIService {
     func isModelConfigured(_ model: String) -> Bool {
         let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedModel.isEmpty else { return isAPIKeyConfigured }
+        guard unrecognizedProviderName(for: trimmedModel) == nil else { return false }
 
         let modelProvider = modelProviders[trimmedModel] ?? provider
         return isAPIKeyConfigured(for: modelProvider, model: trimmedModel)
@@ -4900,6 +4697,13 @@ extension AIService {
             issues.append("Select a default model in Settings > Model tab")
         }
 
+        if let normalizedModel,
+           let providerName = unrecognizedProviderName(for: normalizedModel)
+        {
+            issues.append("The selected model uses unsupported provider \(providerName)")
+            return issues
+        }
+
         if requiresAPIKey(for: activeProvider, model: normalizedModel),
            !isAPIKeyConfigured(for: activeProvider, model: normalizedModel)
         {
@@ -4910,6 +4714,9 @@ extension AIService {
 
     var usableModels: [String] {
         var models = customModels.filter { model in
+            if unrecognizedProviderName(for: model) != nil {
+                return false
+            }
             #if os(watchOS)
                 // Apple Intelligence requires on-device processing which isn't available on watchOS
                 // The watch app makes API calls directly, not via iPhone relay

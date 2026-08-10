@@ -69,35 +69,6 @@ struct RequestBuilderAsyncTests {
     }
 
     @Test
-    func `gitHub Models chat request omits unsupported parallel tool calls option`() async throws {
-        let tools: [[String: Any]] = [[
-            "type": "function",
-            "function": [
-                "name": "lookup",
-                "description": "Look up a value",
-                "parameters": ["type": "object", "properties": [:]]
-            ]
-        ]]
-        let url = try #require(URL(string: "https://models.github.ai/inference/chat/completions"))
-        let request = try #require(await OpenAIRequestBuilder.createChatCompletionsRequestAsync(
-            url: url,
-            messages: [Message(role: .user, content: "Use the lookup tool")],
-            model: "openai/gpt-4o",
-            stream: true,
-            tools: RequestBuilderToolDefinitions(tools),
-            apiKey: "github-token",
-            isAzure: false,
-            isGitHubModels: true
-        ))
-        let bodyData = try #require(request.httpBody)
-        let body = try #require(try JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
-
-        #expect(body["tools"] != nil)
-        #expect(body["tool_choice"] as? String == "auto")
-        #expect(body["parallel_tool_calls"] == nil)
-    }
-
-    @Test
     func `custom chat endpoint omits parallel tool calls option`() async throws {
         let tools: [[String: Any]] = [[
             "type": "function",

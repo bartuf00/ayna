@@ -658,12 +658,10 @@ enum OpenAIRequestBuilder {
     ///   - request: The request to configure (inout)
     ///   - apiKey: API key for authentication
     ///   - isAzure: Whether this is an Azure endpoint
-    ///   - isGitHubModels: Whether this is a GitHub Models endpoint
     static func configureRequest(
         _ request: inout URLRequest,
         apiKey: String,
-        isAzure: Bool,
-        isGitHubModels: Bool = false
+        isAzure: Bool
     ) {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -672,11 +670,6 @@ enum OpenAIRequestBuilder {
 
         if isAzure {
             request.setValue(apiKey, forHTTPHeaderField: "api-key")
-        } else if isGitHubModels {
-            // GitHub Models uses Bearer token with GitHub OAuth token
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-            request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         } else {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
@@ -691,7 +684,6 @@ enum OpenAIRequestBuilder {
         tools: RequestBuilderToolDefinitions = .none,
         apiKey: String,
         isAzure: Bool,
-        isGitHubModels: Bool = false,
         supportsParallelToolCalls: Bool = true,
         attachmentDataLoader: RequestBuilderAttachmentResolver.AttachmentDataLoader? = nil
     ) async -> URLRequest? {
@@ -714,7 +706,6 @@ enum OpenAIRequestBuilder {
                 tools: tools.value,
                 apiKey: apiKey,
                 isAzure: isAzure,
-                isGitHubModels: isGitHubModels,
                 supportsParallelToolCalls: supportsParallelToolCalls
             )
         }
@@ -741,7 +732,6 @@ enum OpenAIRequestBuilder {
     ///   - tools: Optional tool definitions
     ///   - apiKey: API key for authentication
     ///   - isAzure: Whether this is an Azure endpoint
-    ///   - isGitHubModels: Whether this is a GitHub Models endpoint
     /// - Returns: Configured URLRequest, or nil if body encoding fails
     static func createChatCompletionsRequest(
         url: URL,
@@ -751,19 +741,18 @@ enum OpenAIRequestBuilder {
         tools: [[String: Any]]? = nil,
         apiKey: String,
         isAzure: Bool,
-        isGitHubModels: Bool = false,
         supportsParallelToolCalls: Bool = true
     ) -> URLRequest? {
         guard !Task.isCancelled else { return nil }
         var request = URLRequest(url: url)
-        configureRequest(&request, apiKey: apiKey, isAzure: isAzure, isGitHubModels: isGitHubModels)
+        configureRequest(&request, apiKey: apiKey, isAzure: isAzure)
 
         let body = buildChatCompletionsBody(
             messages: messages,
             model: model,
             stream: stream,
             tools: tools,
-            supportsParallelToolCalls: supportsParallelToolCalls && !isGitHubModels
+            supportsParallelToolCalls: supportsParallelToolCalls
         )
 
         guard !Task.isCancelled else { return nil }

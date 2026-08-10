@@ -21,7 +21,6 @@ extension AIServiceGlobalStateTests {
 
             // Use in-memory keychain to avoid touching the real Keychain in tests
             AIService.keychain = InMemoryKeychainStorage()
-            GitHubOAuthService.keychain = InMemoryKeychainStorage()
             MockURLProtocol.reset()
         }
 
@@ -33,6 +32,33 @@ extension AIServiceGlobalStateTests {
             service.customModels = ["gpt-4o"]
             service.selectedModel = "gpt-4o"
             return service
+        }
+
+        @Test
+        func `An unrecognized default provider cannot route inherited models`() throws {
+            let inheritedModel = "future-inherited"
+            let explicitModel = "valid-explicit"
+            let storage = InMemoryKeychainStorage()
+            AIService.keychain = storage
+            defaults.set([inheritedModel, explicitModel], forKey: "customModels")
+            defaults.set("Future Provider", forKey: "aiProvider")
+            defaults.set([explicitModel: "OpenAI"], forKey: "modelProviders")
+            defaults.set(inheritedModel, forKey: "selectedModel")
+            let modelAPIKeys = [
+                inheritedModel: "future-key",
+                explicitModel: "openai-key"
+            ]
+            try storage.setData(JSONEncoder().encode(modelAPIKeys), for: "model_api_keys")
+
+            let service = AIService(urlSession: URLSession(configuration: .ephemeral))
+
+            #expect(service.customModels == [inheritedModel, explicitModel])
+            #expect(service.usableModels == [explicitModel])
+            #expect(!service.isModelConfigured(inheritedModel))
+            #expect(service.selectedModel == explicitModel)
+            #expect(defaults.string(forKey: "aiProvider") == "Future Provider")
+            let persistedData = try #require(try storage.data(for: "model_api_keys"))
+            #expect(try JSONDecoder().decode([String: String].self, from: persistedData) == modelAPIKeys)
         }
 
         @Test
@@ -625,67 +651,6 @@ extension AIServiceGlobalStateTests {
                 // Give time for async callback
                 try? await Task.sleep(for: .milliseconds(500))
             }
-        }
-
-        @Test
-        func `GitHub Models rate limit tracking is per token`() throws {
-            let oauth = GitHubOAuthService()
-
-            let url = try #require(URL(string: "https://models.github.ai/inference/chat/completions"))
-            let now = Date()
-
-            let responseA = try #require(HTTPURLResponse(
-                url: url,
-                statusCode: 200,
-                httpVersion: nil,
-                headerFields: [
-                    "X-RateLimit-Limit": "100",
-                    "X-RateLimit-Remaining": "10",
-                    "X-RateLimit-Reset": "\(Int(now.addingTimeInterval(60).timeIntervalSince1970))",
-                    "X-RateLimit-Resource": "ai-inference"
-                ]
-            ))
-
-            let responseB = try #require(HTTPURLResponse(
-                url: url,
-                statusCode: 200,
-                httpVersion: nil,
-                headerFields: [
-                    "X-RateLimit-Limit": "100",
-                    "X-RateLimit-Remaining": "3",
-                    "X-RateLimit-Reset": "\(Int(now.addingTimeInterval(120).timeIntervalSince1970))",
-                    "X-RateLimit-Resource": "ai-inference"
-                ]
-            ))
-
-            oauth.updateRateLimit(from: responseA, forAccessToken: "token-A")
-            oauth.updateRateLimit(from: responseB, forAccessToken: "token-B")
-
-            #expect(oauth.rateLimitInfo(forAccessToken: "token-A")?.remaining == 10)
-            #expect(oauth.rateLimitInfo(forAccessToken: "token-B")?.remaining == 3)
-        }
-
-        @Test
-        func `GitHub Models retry after is per token`() throws {
-            let oauth = GitHubOAuthService()
-
-            let url = try #require(URL(string: "https://models.github.ai/inference/chat/completions"))
-            let response = try #require(HTTPURLResponse(
-                url: url,
-                statusCode: 429,
-                httpVersion: nil,
-                headerFields: [
-                    "Retry-After": "60"
-                ]
-            ))
-
-            oauth.updateRetryAfter(from: response, forAccessToken: "token-A")
-
-            #expect(oauth.retryAfterDate(forAccessToken: "token-A") != nil)
-            #expect(oauth.retryAfterDate(forAccessToken: "token-B") == nil)
-
-            oauth.clearRetryAfter(forAccessToken: "token-A")
-            #expect(oauth.retryAfterDate(forAccessToken: "token-A") == nil)
         }
 
         @Test(.timeLimit(.minutes(1)))

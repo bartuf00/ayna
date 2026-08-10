@@ -1070,8 +1070,12 @@ final class ConversationManager: ObservableObject {
             }
 
             // Validate and fix models that no longer exist for the in-memory list.
-            let availableModels = AIService.shared.customModels
-            let defaultModel = AIService.shared.selectedModel
+            let usableModels = AIService.shared.usableModels
+            let availableModelSet = Set(usableModels)
+            let selectedModel = AIService.shared.selectedModel
+            let defaultModel = availableModelSet.contains(selectedModel)
+                ? selectedModel
+                : usableModels.first ?? selectedModel
 
             let persistenceState = persistenceCoordinator.reconciliationState()
             guard loadIsCurrent() else {
@@ -1137,9 +1141,11 @@ final class ConversationManager: ObservableObject {
                 }
 
                 var placeholder = placeholderConversation(from: metadata)
-                if !availableModels.contains(placeholder.model) {
-                    placeholder.model = defaultModel
-                }
+                _ = repairUnavailableModels(
+                    in: &placeholder,
+                    availableModels: availableModelSet,
+                    defaultModel: defaultModel
+                )
                 reconciled.append(placeholder)
                 nextMetadataOnlyIds.insert(metadata.id)
             }
@@ -1261,13 +1267,22 @@ final class ConversationManager: ObservableObject {
 
     private func applyCoordinatorLoad(_ loaded: [Conversation]) {
         var repaired = loaded
-        let availableModels = AIService.shared.customModels
-        let defaultModel = AIService.shared.selectedModel
+        let usableModels = AIService.shared.usableModels
+        let availableModelSet = Set(usableModels)
+        let selectedModel = AIService.shared.selectedModel
+        let defaultModel = availableModelSet.contains(selectedModel)
+            ? selectedModel
+            : usableModels.first ?? selectedModel
         var repairedIds: [UUID] = []
 
-        for index in repaired.indices where !availableModels.contains(repaired[index].model) {
-            repaired[index].model = defaultModel
-            repairedIds.append(repaired[index].id)
+        for index in repaired.indices {
+            if repairUnavailableModels(
+                in: &repaired[index],
+                availableModels: availableModelSet,
+                defaultModel: defaultModel
+            ) {
+                repairedIds.append(repaired[index].id)
+            }
         }
         repaired.sort { lhs, rhs in
             if lhs.updatedAt == rhs.updatedAt {
@@ -1318,6 +1333,33 @@ final class ConversationManager: ObservableObject {
             self.loadRetryTask = nil
             await self.loadConversations()
         }
+    }
+
+    private func repairUnavailableModels(
+        in conversation: inout Conversation,
+        availableModels: Set<String>,
+        defaultModel: String
+    ) -> Bool {
+        var didRepair = false
+
+        if !availableModels.contains(conversation.model) {
+            conversation.model = defaultModel
+            didRepair = true
+        }
+
+        let supportedActiveModels = conversation.activeModels.filter {
+            availableModels.contains($0)
+        }
+        if supportedActiveModels != conversation.activeModels {
+            conversation.activeModels = supportedActiveModels
+            didRepair = true
+        }
+        if conversation.multiModelEnabled, supportedActiveModels.count < 2 {
+            conversation.multiModelEnabled = false
+            didRepair = true
+        }
+
+        return didRepair
     }
 
     private func scheduleSearchIndexWarmup(for conversationIds: Set<UUID>) {
@@ -1563,11 +1605,17 @@ final class ConversationManager: ObservableObject {
                 return conversationSnapshot(byId: conversationId)
             }
 
-            let availableModels = AIService.shared.customModels
-            let storageModelWasUnavailable = !availableModels.contains(loadedConversation.model)
-            if storageModelWasUnavailable {
-                loadedConversation.model = AIService.shared.selectedModel
-            }
+            let usableModels = AIService.shared.usableModels
+            let availableModelSet = Set(usableModels)
+            let selectedModel = AIService.shared.selectedModel
+            let defaultModel = availableModelSet.contains(selectedModel)
+                ? selectedModel
+                : usableModels.first ?? selectedModel
+            let storageConversationWasRepaired = repairUnavailableModels(
+                in: &loadedConversation,
+                availableModels: availableModelSet,
+                defaultModel: defaultModel
+            )
 
             let dirtyIds = persistenceCoordinator.pendingConversationIds()
             guard !dirtyIds.contains(conversationId) else {
@@ -1586,18 +1634,18 @@ final class ConversationManager: ObservableObject {
                 from: currentConversation,
                 into: loadedConversation
             )
-            let appliedDefaultModelRepair = storageModelWasUnavailable
-                && !availableModels.contains(mergedConversation.model)
-            if appliedDefaultModelRepair {
-                mergedConversation.model = loadedConversation.model
-            }
+            let mergedConversationWasRepaired = repairUnavailableModels(
+                in: &mergedConversation,
+                availableModels: availableModelSet,
+                defaultModel: defaultModel
+            )
             conversations[index] = mergedConversation
             metadataOnlyConversationIds.remove(conversationId)
             metadataSearchTextById.removeValue(forKey: conversationId)
             #if !os(watchOS)
                 indexConversation(mergedConversation)
             #endif
-            if storageModelWasUnavailable {
+            if storageConversationWasRepaired || mergedConversationWasRepaired {
                 _ = persistenceCoordinator.enqueueDerivedUpdateIfCurrent(mergedConversation)
             }
             return conversationSnapshot(byId: conversationId)
