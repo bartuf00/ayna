@@ -172,45 +172,22 @@ extension MacChatView {
         // Find previous image path (cheap, no disk I/O)
         let previousImagePath = findPreviousImagePath()
 
-        // Create a response group for the multi-model comparison
-        let responseGroupId = UUID()
-        var responseEntries: [ResponseGroup.ResponseEntry] = []
-        var messageIds: [String: UUID] = [:]
-
-        // Create placeholder messages for each model
-        for model in models {
-            let messageId = UUID()
-            messageIds[model] = messageId
-
-            let placeholderMessage = Message(
-                id: messageId,
-                role: .assistant,
-                content: "",
-                model: model,
-                responseGroupId: responseGroupId,
-                mediaType: .image
-            )
-            conversationManager.addMessage(to: conversation, message: placeholderMessage)
-
-            responseEntries.append(ResponseGroup.ResponseEntry(
-                id: messageId,
-                modelName: model,
-                status: .streaming
-            ))
-        }
-
-        // Create response group
-        let userMessageId = conversation.messages.first(where: { $0.role == .user })?.id
-            ?? conversation.messages.last(where: { $0.role == .user })?.id ?? UUID()
-        let responseGroup = ResponseGroup(
-            id: responseGroupId,
+        let userMessageId = conversation.messages.last(where: { $0.role == .user })?.id ?? UUID()
+        let responsePlan = MultiModelResponsePlan(
+            models: models,
             userMessageId: userMessageId,
-            responses: responseEntries
+            mediaType: .image
         )
+        let responseGroupId = responsePlan.responseGroupId
+        let messageIds = responsePlan.messageIDsByModel
+
+        for placeholderMessage in responsePlan.placeholderMessages {
+            conversationManager.addMessage(to: conversation, message: placeholderMessage)
+        }
 
         // Add response group to conversation
         if let index = conversationManager.conversations.firstIndex(where: { $0.id == conversation.id }) {
-            conversationManager.conversations[index].responseGroups.append(responseGroup)
+            conversationManager.conversations[index].responseGroups.append(responsePlan.responseGroup)
         }
 
         registerImageBatchCancellation(
@@ -464,30 +441,16 @@ extension MacChatView {
             return
         }
 
-        // Create response group
-        let responseGroupId = UUID()
-        var responseGroup = ResponseGroup(id: responseGroupId, userMessageId: userMessageId)
-
-        // Create placeholder messages for each model
-        let messageIds = Dictionary(uniqueKeysWithValues: models.map { ($0, UUID()) })
-        for model in models {
-            guard let messageId = messageIds[model] else { continue }
-            responseGroup.addResponse(messageId: messageId, modelName: model, status: .streaming)
-
-            let placeholderMessage = Message(
-                id: messageId,
-                role: .assistant,
-                content: "",
-                model: model,
-                responseGroupId: responseGroupId
-            )
+        let responsePlan = MultiModelResponsePlan(models: models, userMessageId: userMessageId)
+        let responseGroupId = responsePlan.responseGroupId
+        for placeholderMessage in responsePlan.placeholderMessages {
             conversationManager.addMessage(to: conversation, message: placeholderMessage)
         }
 
         // Add response group to conversation
-        conversationManager.addResponseGroup(to: conversation, group: responseGroup)
+        conversationManager.addResponseGroup(to: conversation, group: responsePlan.responseGroup)
 
-        let messageIdsByModel = messageIds
+        let messageIdsByModel = responsePlan.messageIDsByModel
 
         // Prepare messages for API
         var messagesToSend = updatedConversation.getEffectiveHistory()
@@ -504,6 +467,7 @@ extension MacChatView {
         activeAssistantMessageID = nil
         activeMultiModelResponseGroupID = responseGroupId
         let operationID = coordinator.beginOperation(conversationID: conversationId)
+        multiModelReasoningBuffer.resetAll()
         let request = aiService.sendToMultipleModels(
             messages: messagesToSend,
             models: models,
@@ -527,6 +491,7 @@ extension MacChatView {
             onModelComplete: { model in
                 coordinator.enqueueCallback(for: operationID, conversationID: conversationId) {
                     guard let messageId = messageIdsByModel[model] else { return }
+                    multiModelReasoningBuffer.finish(for: messageId)
 
                     // Update response group status
                     if let convIndex = conversationManager.conversations.firstIndex(where: {
@@ -548,6 +513,7 @@ extension MacChatView {
             onAllComplete: {
                 coordinator.enqueueCallback(for: operationID, conversationID: conversationId) {
                     guard coordinator.owns(operationID, conversationID: conversationId) else { return }
+                    multiModelReasoningBuffer.finishAll()
                     isGenerating = false
                     logChat("🏁 All models completed", level: .info)
 
@@ -564,6 +530,7 @@ extension MacChatView {
             onError: { model, error in
                 coordinator.enqueueCallback(for: operationID, conversationID: conversationId) {
                     guard let messageId = messageIdsByModel[model] else { return }
+                    multiModelReasoningBuffer.finish(for: messageId)
 
                     // Update response group status to failed
                     if let convIndex = conversationManager.conversations.firstIndex(where: {
@@ -615,10 +582,49 @@ extension MacChatView {
                     )
                 }
             },
-            onReasoning: nil
+            onReasoning: { model, reasoning in
+                coordinator.enqueueCallback(for: operationID, conversationID: conversationId) {
+                    bufferMultiModelReasoning(reasoning, model: model, messageIdsByModel: messageIdsByModel, conversationId: conversationId)
+                }
+            }
         )
         coordinator.onCancel(for: operationID) {
+            finishAndPersistMultiModelReasoning(conversationId: conversationId)
             request.cancel()
+        }
+    }
+
+    private func bufferMultiModelReasoning(
+        _ reasoning: String,
+        model: String,
+        messageIdsByModel: [String: UUID],
+        conversationId: UUID
+    ) {
+        guard !reasoning.isEmpty,
+              let messageId = messageIdsByModel[model]
+        else { return }
+
+        let conversationManager = conversationManager
+        multiModelReasoningBuffer.buffer(for: messageId) { reasoningChunk in
+            guard conversationManager.updateMessage(
+                conversationId: conversationId,
+                messageId: messageId,
+                update: { message in
+                    message.reasoning = (message.reasoning ?? "") + reasoningChunk
+                }
+            ) else {
+                return
+            }
+            if let conversation = conversationManager.conversation(byId: conversationId) {
+                conversationManager.save(conversation)
+            }
+        }.append(reasoning)
+    }
+
+    private func finishAndPersistMultiModelReasoning(conversationId: UUID) {
+        multiModelReasoningBuffer.finishAll()
+        if let conversation = conversationManager.conversation(byId: conversationId) {
+            conversationManager.saveImmediately(conversation)
         }
     }
 }

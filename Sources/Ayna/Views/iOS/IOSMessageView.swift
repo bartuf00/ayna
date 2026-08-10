@@ -18,6 +18,8 @@ import UniformTypeIdentifiers
 
 struct IOSMessageView: View {
     let message: Message
+    let displayKind: ChatTranscriptDisplayKind?
+    let isGenerating: Bool
     var onRetry: (() -> Void)?
     var onSwitchModel: ((String) -> Void)?
     var onEdit: ((String) -> Void)?
@@ -34,12 +36,16 @@ struct IOSMessageView: View {
 
     init(
         message: Message,
+        displayKind: ChatTranscriptDisplayKind? = nil,
+        isGenerating: Bool = false,
         onRetry: (() -> Void)? = nil,
         onSwitchModel: ((String) -> Void)? = nil,
         onEdit: ((String) -> Void)? = nil,
         availableModels: [String] = []
     ) {
         self.message = message
+        self.displayKind = displayKind
+        self.isGenerating = isGenerating
         self.onRetry = onRetry
         self.onSwitchModel = onSwitchModel
         self.onEdit = onEdit
@@ -57,7 +63,9 @@ struct IOSMessageView: View {
         // Pre-set hasAppeared to true for messages that are likely already in view
         // This prevents janky animations when scrolling through existing messages
         _hasAppeared = State(
-            initialValue: !message.content.isEmpty || !(message.citations?.isEmpty ?? true)
+            initialValue: !message.content.isEmpty
+                || !(message.citations?.isEmpty ?? true)
+                || !(message.reasoning?.isEmpty ?? true)
         )
     }
 
@@ -156,6 +164,25 @@ struct IOSMessageView: View {
 
     // MARK: - Regular Message View
 
+    private var shouldShowTypingIndicator: Bool {
+        guard !hasReasoning else { return false }
+
+        if let displayKind {
+            return displayKind == .typingPlaceholder
+        }
+
+        return message.role == .assistant
+            && message.content.isEmpty
+            && message.mediaType != .image
+            && (message.citations?.isEmpty ?? true)
+            && (message.toolCalls == nil || message.toolCalls?.isEmpty == true)
+    }
+
+    private var hasReasoning: Bool {
+        guard message.role == .assistant, let reasoning = message.reasoning else { return false }
+        return !reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// Whether this message should be hidden (empty assistant message waiting for tool execution)
     private var shouldHideMessage: Bool {
         // Hide empty assistant messages that have pending tool calls
@@ -163,6 +190,7 @@ struct IOSMessageView: View {
         message.role == .assistant &&
             message.content.isEmpty &&
             message.mediaType != .image &&
+            !hasReasoning &&
             message.toolCalls != nil &&
             !(message.toolCalls?.isEmpty ?? true)
     }
@@ -239,12 +267,17 @@ struct IOSMessageView: View {
                     }
                 }
 
+                if hasReasoning, let reasoning = message.reasoning {
+                    IOSReasoningView(
+                        reasoning: reasoning,
+                        initiallyExpanded: message.content.isEmpty,
+                        isStreaming: isGenerating
+                    )
+                }
+
                 // Show typing indicator for empty assistant messages (waiting for response)
                 // Don't show if the message has tool calls (it's waiting for tool execution)
-                if message.role == .assistant, message.content.isEmpty, message.mediaType != .image,
-                   message.toolCalls == nil || message.toolCalls?.isEmpty == true,
-                   message.citations?.isEmpty ?? true
-                {
+                if shouldShowTypingIndicator {
                     IOSTypingIndicatorView()
                 } else if contentBlocks.isEmpty {
                     if !message.content.isEmpty {
@@ -492,6 +525,106 @@ struct IOSMessageView: View {
                 @unknown default:
                     break
                 }
+            }
+        }
+    }
+}
+
+/// Collapsible reasoning content shared by single- and multi-model iOS responses.
+struct IOSReasoningView: View {
+    let reasoning: String
+    let isStreaming: Bool
+
+    @State private var isExpanded: Bool
+    @State private var contentBlocks: [ContentBlock]
+    @State private var parseTask: Task<Void, Never>?
+    @State private var parseGeneration = 0
+
+    init(reasoning: String, initiallyExpanded: Bool, isStreaming: Bool) {
+        self.reasoning = reasoning
+        self.isStreaming = isStreaming
+        _isExpanded = State(initialValue: initiallyExpanded)
+        _contentBlocks = State(initialValue: MarkdownRenderer.cachedBlocks(for: reasoning) ?? [])
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Spacing.xs) {
+            Button {
+                withAnimation(Motion.easeStandard) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: Spacing.xs) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(Typography.caption)
+                    Text("Reasoning")
+                        .font(Typography.captionBold)
+                    Spacer(minLength: 0)
+                    Text("\(reasoning.count) chars")
+                        .font(Typography.micro)
+                        .foregroundStyle(Theme.textSecondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isExpanded ? "Hide reasoning" : "Show reasoning")
+            .accessibilityValue("\(reasoning.count) characters")
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: Spacing.sm) {
+                    if contentBlocks.isEmpty {
+                        Text(verbatim: reasoning)
+                    } else {
+                        ForEach(contentBlocks) { block in
+                            IOSContentBlockView(block: block)
+                        }
+                    }
+                }
+                .padding(Spacing.sm)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    Theme.textSecondary.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: Spacing.CornerRadius.md)
+                )
+            }
+        }
+        .onChange(of: reasoning) { _, newReasoning in
+            scheduleParse(for: newReasoning)
+        }
+        .onChange(of: isStreaming) { wasStreaming, isStreaming in
+            if wasStreaming, !isStreaming {
+                scheduleParse(for: reasoning)
+            }
+        }
+        .task {
+            if contentBlocks.isEmpty {
+                scheduleParse(for: reasoning)
+            }
+        }
+        .onDisappear {
+            parseTask?.cancel()
+        }
+    }
+
+    private func scheduleParse(for reasoning: String) {
+        parseTask?.cancel()
+        parseGeneration += 1
+        let generation = parseGeneration
+        let shouldDebounce = isStreaming
+        let cachePolicy: MarkdownRenderer.CachePolicy = isStreaming ? .doNotCache : .useCache
+
+        parseTask = Task.detached(priority: .userInitiated) {
+            if shouldDebounce {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard !Task.isCancelled else { return }
+            let blocks = MarkdownRenderer.parse(reasoning, cachePolicy: cachePolicy)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard generation == parseGeneration, self.reasoning == reasoning else {
+                    return
+                }
+                contentBlocks = blocks
             }
         }
     }

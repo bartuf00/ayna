@@ -15,6 +15,8 @@ struct MultiModelResponseView: View {
     let responseGroupId: UUID
     let responses: [Message]
     let conversation: Conversation
+    /// ID of the response that would be auto-selected if the user continues without choosing.
+    var defaultCandidateId: UUID?
     var onSelectResponse: ((UUID) -> Void)?
     var onRetry: ((Message) -> Void)?
 
@@ -30,15 +32,6 @@ struct MultiModelResponseView: View {
 
     private var isSelectionMade: Bool {
         selectedResponseId != nil
-    }
-
-    private var defaultCandidateId: UUID? {
-        // 1. Primary: conversation.model
-        if let match = responses.first(where: { $0.model == conversation.model }) {
-            return match.id
-        }
-        // 2. Fallback: First model
-        return responses.first?.id
     }
 
     /// Determines the grid layout based on number of responses
@@ -128,6 +121,9 @@ struct MultiModelResponseCard: View {
 
     @State private var isHovered = false
     @State private var cachedContentBlocks: [ContentBlock]
+    @State private var cachedReasoningBlocks: [ContentBlock]
+    @State private var reasoningParseTask: Task<Void, Never>?
+    @State private var reasoningParseGeneration = 0
     @State private var decodedImage: NSImage?
 
     init(
@@ -147,6 +143,9 @@ struct MultiModelResponseCard: View {
         self.onSelect = onSelect
         self.onRetry = onRetry
         _cachedContentBlocks = State(initialValue: MarkdownRenderer.parse(message.content))
+        _cachedReasoningBlocks = State(
+            initialValue: message.reasoning.flatMap { MarkdownRenderer.cachedBlocks(for: $0) } ?? []
+        )
     }
 
     private var modelName: String {
@@ -208,6 +207,14 @@ struct MultiModelResponseCard: View {
                     }
                 }
             }
+            .onChange(of: message.reasoning) { _, newReasoning in
+                scheduleReasoningParse(for: newReasoning ?? "")
+            }
+            .onChange(of: isStreaming) { wasStreaming, isStreaming in
+                if wasStreaming, !isStreaming {
+                    scheduleReasoningParse(for: message.reasoning ?? "")
+                }
+            }
             .onChange(of: message.imageData) { _, newImageData in
                 if newImageData != nil {
                     decodedImage = nil
@@ -221,9 +228,15 @@ struct MultiModelResponseCard: View {
                 }
             }
             .task {
+                if cachedReasoningBlocks.isEmpty {
+                    scheduleReasoningParse(for: message.reasoning ?? "")
+                }
                 if message.mediaType == .image, decodedImage == nil {
                     loadImage()
                 }
+            }
+            .onDisappear {
+                reasoningParseTask?.cancel()
             }
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Response from \(modelName)")
@@ -286,7 +299,12 @@ struct MultiModelResponseCard: View {
     }
 
     private var contentScrollView: some View {
-        ScrollView {
+        let contentPlan = MultiModelResponseContentPlan(
+            message: message,
+            responseStatus: responseStatus
+        )
+
+        return ScrollView {
             VStack(alignment: .leading, spacing: Spacing.sm) {
                 if message.mediaType == .image {
                     // Image generation content
@@ -326,14 +344,24 @@ struct MultiModelResponseCard: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, Spacing.xxl)
                     }
-                } else if message.content.isEmpty, isStreaming {
-                    TypingIndicatorView()
-                        .padding(.vertical, Spacing.sm)
                 } else if hasFailed {
                     failedContentView
                 } else {
-                    ForEach(cachedContentBlocks, id: \.id) { block in
-                        block.view
+                    if let reasoning = contentPlan.reasoning {
+                        reasoningView(reasoning)
+                    }
+
+                    if contentPlan.showsTypingIndicator {
+                        TypingIndicatorView()
+                            .padding(.vertical, Spacing.sm)
+                    } else if !message.content.isEmpty {
+                        if cachedContentBlocks.isEmpty {
+                            Text(verbatim: message.content)
+                        } else {
+                            ForEach(cachedContentBlocks, id: \.id) { block in
+                                block.view
+                            }
+                        }
                     }
                 }
             }
@@ -341,6 +369,55 @@ struct MultiModelResponseCard: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(minHeight: 120, maxHeight: 300)
+    }
+
+    private func reasoningView(_ reasoning: String) -> some View {
+        VStack(alignment: .leading, spacing: Spacing.sm) {
+            Label("Reasoning", systemImage: "brain.head.profile")
+                .font(Typography.captionBold)
+                .foregroundStyle(Theme.textSecondary)
+
+            if cachedReasoningBlocks.isEmpty {
+                Text(verbatim: reasoning)
+            } else {
+                ForEach(cachedReasoningBlocks, id: \.id) { block in
+                    block.view
+                }
+            }
+        }
+        .padding(Spacing.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            Theme.textSecondary.opacity(0.08),
+            in: RoundedRectangle(cornerRadius: Spacing.CornerRadius.md)
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Reasoning")
+    }
+
+    private func scheduleReasoningParse(for reasoning: String) {
+        reasoningParseTask?.cancel()
+        reasoningParseGeneration += 1
+        let generation = reasoningParseGeneration
+        let shouldDebounce = isStreaming
+        let cachePolicy: MarkdownRenderer.CachePolicy = isStreaming ? .doNotCache : .useCache
+
+        reasoningParseTask = Task.detached(priority: .userInitiated) {
+            if shouldDebounce {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            guard !Task.isCancelled else { return }
+            let blocks = MarkdownRenderer.parse(reasoning, cachePolicy: cachePolicy)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard generation == reasoningParseGeneration,
+                      message.reasoning ?? "" == reasoning
+                else {
+                    return
+                }
+                cachedReasoningBlocks = blocks
+            }
+        }
     }
 
     private func loadImage() {
@@ -615,7 +692,8 @@ struct MultiModelSelector: View {
             return MultiModelResponseView(
                 responseGroupId: groupId,
                 responses: responses,
-                conversation: conversation
+                conversation: conversation,
+                defaultCandidateId: responses.first?.id
             )
             .frame(width: 800)
             .padding()

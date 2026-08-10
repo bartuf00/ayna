@@ -99,6 +99,7 @@ typealias IOSBuiltInToolExecutor = @MainActor (
     private var pendingChunkBuffers: [StreamingChunkKey: PendingChunkBuffer] = [:]
     private let streamingChunkFlushInterval: Duration = .milliseconds(75)
     private let streamingChunkImmediateFlushThreshold = 256
+    private let multiModelReasoningBuffer = MultiModelStreamingBuffer()
 
     private struct ToolExecutionState {
         let token: ToolCallRequestRoundCoordinator<ToolExecutionResult>.ToolToken
@@ -1845,15 +1846,17 @@ extension IOSChatViewModel {
         isGenerating = true
         errorMessage = nil
 
-        let responseGroupId = UUID()
-        var messageIds: [String: UUID] = [:]
-        var placeholderMessages: [Message] = []
-        let responseGroup = createPlaceholderMessagesForMultiModel(
-            models: models, userMessageId: userMessage.id, responseGroupId: responseGroupId,
-            messageIds: &messageIds, placeholderMessages: &placeholderMessages
+        let responsePlan = createResponsePlanForMultiModel(
+            models: models,
+            userMessageId: userMessage.id
         )
-        let messageIdsByModel = messageIds
-        conversationManager.addMultiModelResponse(to: targetConversation, messages: placeholderMessages, responseGroup: responseGroup)
+        let responseGroupId = responsePlan.responseGroupId
+        let messageIdsByModel = responsePlan.messageIDsByModel
+        conversationManager.addMultiModelResponse(
+            to: targetConversation,
+            messages: responsePlan.placeholderMessages,
+            responseGroup: responsePlan.responseGroup
+        )
 
         guard let updatedConversation = conversation else {
             isGenerating = false
@@ -1869,6 +1872,7 @@ extension IOSChatViewModel {
             activeAssistantMessageId = nil
             activeMultiModelResponseGroupId = responseGroupId
             let operationID = coordinator.beginOperation(conversationID: conversationId)
+            multiModelReasoningBuffer.resetAll()
             let request = aiService.sendToMultipleModels(
             messages: messagesToSend,
             models: models,
@@ -1912,24 +1916,9 @@ extension IOSChatViewModel {
             },
             onAllComplete: { [weak self] in
                     coordinator.enqueueCallback(for: operationID, conversationID: conversationId) { [weak self] in
-                        guard let self,
-                              coordinator.owns(operationID, conversationID: conversationId)
-                        else {
-                            return
-                        }
-
-                    self.flushAllStreamingChunks(conversationId: conversationId)
-                    self.isGenerating = false
-                    if let convIndex = self.conversationManager.conversations.firstIndex(where: { $0.id == conversationId }) {
-                            self.conversationManager.saveImmediately(self.conversationManager.conversations[convIndex])
-                    }
-                        self.activeMultiModelResponseGroupId = nil
-                        guard coordinator.finishOperation(operationID) else { return }
-
-                    // Notify that conversation is ready (for new chat navigation)
-                    if self.isNewChatMode {
-                        self.onConversationCreated?(conversationId)
-                    }
+                        self?.finishMultiModelGeneration(
+                            operationID: operationID, conversationId: conversationId, coordinator: coordinator
+                        )
                 }
             },
             onError: { [weak self] model, error in
@@ -1945,11 +1934,50 @@ extension IOSChatViewModel {
                 }
             },
             onPendingToolCall: nil,
-            onReasoning: nil
+            onReasoning: { [weak self] model, reasoning in
+                coordinator.enqueueCallback(for: operationID, conversationID: conversationId) { [weak self] in
+                    guard let self, coordinator.owns(operationID, conversationID: conversationId) else { return }
+                    self.processMultiModelReasoning(
+                        model: model,
+                        reasoning,
+                        messageIds: messageIdsByModel,
+                        conversationId: conversationId
+                    )
+                }
+            }
         )
-            coordinator.onCancel(for: operationID) {
+            coordinator.onCancel(for: operationID) { [weak self] in
+                self?.finishAndPersistMultiModelReasoning(conversationId: conversationId)
                 request.cancel()
             }
+    }
+
+    private func finishMultiModelGeneration(
+        operationID: ToolChainCoordinator.OperationID,
+        conversationId: UUID,
+        coordinator: ToolChainCoordinator
+    ) {
+        guard coordinator.owns(operationID, conversationID: conversationId) else { return }
+
+        multiModelReasoningBuffer.finishAll()
+        flushAllStreamingChunks(conversationId: conversationId)
+        isGenerating = false
+        if let conversationIndex = conversationManager.conversations.firstIndex(where: { $0.id == conversationId }) {
+            conversationManager.saveImmediately(conversationManager.conversations[conversationIndex])
+        }
+        activeMultiModelResponseGroupId = nil
+        guard coordinator.finishOperation(operationID) else { return }
+
+        if isNewChatMode {
+            onConversationCreated?(conversationId)
+        }
+    }
+
+    private func finishAndPersistMultiModelReasoning(conversationId: UUID) {
+        multiModelReasoningBuffer.finishAll()
+        if let conversation = conversationManager.conversation(byId: conversationId) {
+            conversationManager.saveImmediately(conversation)
+        }
     }
 
     /// Gets or creates a conversation configured for multi-model mode
@@ -1976,22 +2004,19 @@ extension IOSChatViewModel {
         return updatedConv
     }
 
-    /// Creates placeholder messages for each model in a multi-model request
-    func createPlaceholderMessagesForMultiModel(
+    /// Creates the immutable setup for a multi-model request.
+    func createResponsePlanForMultiModel(
         models: [String],
         userMessageId: UUID,
-        responseGroupId: UUID,
-        messageIds: inout [String: UUID],
-        placeholderMessages: inout [Message]
-    ) -> ResponseGroup {
-        var responseGroup = ResponseGroup(id: responseGroupId, userMessageId: userMessageId)
-        for model in models {
-            let messageId = UUID()
-            messageIds[model] = messageId
-            responseGroup.addResponse(messageId: messageId, modelName: model, status: .streaming)
-            placeholderMessages.append(Message(id: messageId, role: .assistant, content: "", model: model, responseGroupId: responseGroupId))
-        }
-        return responseGroup
+        responseGroupId: UUID = UUID(),
+        mediaType: Message.MediaType? = nil
+    ) -> MultiModelResponsePlan {
+        MultiModelResponsePlan(
+            models: models,
+            userMessageId: userMessageId,
+            responseGroupId: responseGroupId,
+            mediaType: mediaType
+        )
     }
 
     /// Processes a streaming chunk for a specific model in multi-model mode
@@ -2019,6 +2044,35 @@ extension IOSChatViewModel {
         )
     }
 
+    func processMultiModelReasoning(
+        model: String,
+        _ reasoning: String,
+        messageIds: [String: UUID],
+        conversationId: UUID
+    ) {
+        guard !reasoning.isEmpty,
+              let messageId = messageIds[model]
+        else {
+            return
+        }
+
+        let conversationManager = conversationManager
+        multiModelReasoningBuffer.buffer(for: messageId) { reasoningChunk in
+            guard conversationManager.updateMessage(
+                conversationId: conversationId,
+                messageId: messageId,
+                update: { message in
+                    message.reasoning = (message.reasoning ?? "") + reasoningChunk
+                }
+            ) else {
+                return
+            }
+            if let conversation = conversationManager.conversation(byId: conversationId) {
+                conversationManager.save(conversation)
+            }
+        }.append(reasoning)
+    }
+
     /// Processes completion for a specific model in multi-model mode
     func processMultiModelCompletion(
         model: String,
@@ -2027,6 +2081,7 @@ extension IOSChatViewModel {
         responseGroupId: UUID
     ) {
         guard let messageId = messageIds[model] else { return }
+        multiModelReasoningBuffer.finish(for: messageId)
         flushStreamingChunks(
             conversationId: conversationId,
             messageId: messageId,
@@ -2059,6 +2114,7 @@ extension IOSChatViewModel {
         responseGroupId: UUID
     ) {
         guard let messageId = messageIds[model] else { return }
+        multiModelReasoningBuffer.finish(for: messageId)
         flushStreamingChunks(
             conversationId: conversationId,
             messageId: messageId,
@@ -2106,7 +2162,7 @@ extension IOSChatViewModel {
             let cancelledAutoSend = cancelPendingAutoSend()
             let cancelledPreparation = cancelSendPreparation()
             let hadActiveTextState = activeAssistantMessageId != nil || activeMultiModelResponseGroupId != nil
-            let hadBufferedText = !pendingChunkBuffers.isEmpty
+            let hadBufferedText = !pendingChunkBuffers.isEmpty || !multiModelReasoningBuffer.isEmpty
             let hadToolExecutions = !toolExecutionStates.isEmpty
             let cancelledToolChain = toolChainCoordinator.cancelCurrentOperation {
                 finalizePersistedTextGeneration()
@@ -2128,6 +2184,7 @@ extension IOSChatViewModel {
         private func finalizePersistedTextGeneration() {
             let assistantMessageId = activeAssistantMessageId
             let responseGroupId = activeMultiModelResponseGroupId
+            let flushedReasoning = multiModelReasoningBuffer.finishAll()
             guard let conversationId,
                   let conversationIndex = conversationManager.conversations.firstIndex(where: { $0.id == conversationId })
             else {
@@ -2140,7 +2197,7 @@ extension IOSChatViewModel {
 
             let flushedText = flushAllStreamingChunks(conversationId: conversationId)
             let persistedTools = persistUnfinishedToolExecutions(conversationId: conversationId)
-            guard assistantMessageId != nil || responseGroupId != nil || flushedText || persistedTools else {
+            guard assistantMessageId != nil || responseGroupId != nil || flushedText || flushedReasoning || persistedTools else {
                 activeMultiModelResponseGroupId = nil
                 return
             }
@@ -2333,40 +2390,19 @@ extension IOSChatViewModel {
         isGenerating = true
         errorMessage = nil
 
-        let responseGroupId = UUID()
-        var responseEntries: [ResponseGroup.ResponseEntry] = []
-        var messageIds: [String: UUID] = [:]
-
-        for model in models {
-            let messageId = UUID()
-            messageIds[model] = messageId
-
-            let placeholderMessage = Message(
-                id: messageId,
-                role: .assistant,
-                content: "",
-                model: model,
-                responseGroupId: responseGroupId,
-                mediaType: .image
-            )
-            conversationManager.addMessage(to: conversation, message: placeholderMessage)
-
-            responseEntries.append(ResponseGroup.ResponseEntry(
-                id: messageId,
-                modelName: model,
-                status: .streaming
-            ))
-        }
-
-        let responseGroup = ResponseGroup(
-            id: responseGroupId,
+        let responsePlan = createResponsePlanForMultiModel(
+            models: models,
             userMessageId: userMessage.id,
-            responses: responseEntries
+            mediaType: .image
         )
+        let responseGroupId = responsePlan.responseGroupId
+        let messageIds = responsePlan.messageIDsByModel
 
-        if let index = conversationManager.conversations.firstIndex(where: { $0.id == conversationId }) {
-            conversationManager.conversations[index].responseGroups.append(responseGroup)
+        for placeholderMessage in responsePlan.placeholderMessages {
+            conversationManager.addMessage(to: conversation, message: placeholderMessage)
         }
+
+        conversationManager.addResponseGroup(to: conversation, group: responsePlan.responseGroup)
 
         let conversationManager = conversationManager
         let cancelledMessageIDs = Array(messageIds.values)

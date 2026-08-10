@@ -30,6 +30,7 @@ struct MacNewChatView: View {
         @State var toolChainCoordinator = ToolChainCoordinator()
         @State private var toolCallRequestRoundCoordinator = ToolCallRequestRoundCoordinator<ToolExecutionResult>()
         @State var imageGenerationCoordinator = ImageGenerationCoordinator()
+        @State var multiModelReasoningBuffer = MultiModelStreamingBuffer()
         @State private var sendPreparationTask: Task<Void, Never>?
         @State private var sendPreparationID: UUID?
 
@@ -55,42 +56,9 @@ struct MacNewChatView: View {
 
     // MARK: - Multi-Model Display
 
-    /// Represents either a single message or a group of parallel responses
-    private enum DisplayableItem: Identifiable {
-        case message(Message)
-        case responseGroup(groupId: UUID, responses: [Message])
-
-        var id: String {
-            switch self {
-            case let .message(msg):
-                msg.id.uuidString
-            case let .responseGroup(groupId, _):
-                "group-\(groupId.uuidString)"
-            }
-        }
-    }
-
-    /// Get visible messages (filtering out system and tool messages)
-    private var visibleMessages: [Message] {
+    private var displayableItems: [ChatTranscriptItem] {
         guard let conversation = currentConversation else { return [] }
-        return conversation.messages.filter { message in
-            MacChatMessagePresentation.isVisible(
-                message,
-                lastMessageID: conversation.messages.last?.id,
-                isGenerating: isGenerating
-            )
-        }
-    }
-
-    /// Converts visible messages into displayable items, grouping multi-model responses together
-    private var displayableItems: [DisplayableItem] {
-        DisplayableMessageGrouper.displayableItems(
-            from: visibleMessages,
-            makeMessage: { .message($0) },
-            makeResponseGroup: { groupId, responses in
-                .responseGroup(groupId: groupId, responses: responses)
-            }
-        )
+        return ChatTranscriptPlan(conversation: conversation, isGenerating: isGenerating).items
     }
 
     private var needsModelSetup: Bool {
@@ -156,9 +124,11 @@ struct MacNewChatView: View {
                             LazyVStack(spacing: 0) {
                                 ForEach(displayableItems) { item in
                                     switch item {
-                                    case let .message(message):
+                                    case let .message(transcriptMessage):
+                                        let message = transcriptMessage.message
                                         MacMessageView(
                                             message: message,
+                                            displayKind: transcriptMessage.displayKind,
                                             modelName: message.model,
                                             onRetry: nil,
                                             onSwitchModel: nil,
@@ -177,16 +147,17 @@ struct MacNewChatView: View {
                                                 } : nil
                                         )
                                         .id(message.id)
-                                    case let .responseGroup(groupId, responses):
+                                    case let .responseGroup(group):
                                         if let conversation = currentConversation {
                                             MultiModelResponseView(
-                                                responseGroupId: groupId,
-                                                responses: responses,
+                                                responseGroupId: group.id,
+                                                responses: group.messages,
                                                 conversation: conversation,
+                                                defaultCandidateId: group.defaultCandidateId,
                                                 onSelectResponse: { messageId in
                                                     conversationManager.selectResponse(
                                                         in: conversation,
-                                                        groupId: groupId,
+                                                        groupId: group.id,
                                                         messageId: messageId
                                                     )
                                                 },
@@ -724,37 +695,21 @@ struct MacNewChatView: View {
             return
         }
 
-        let responseGroupId = UUID()
-        var responseEntries: [ResponseGroup.ResponseEntry] = []
-        var messageIds: [String: UUID] = [:]
+        let userMessageId = conversation.messages.last(where: { $0.role == .user })?.id ?? UUID()
+        let responsePlan = MultiModelResponsePlan(
+            models: models,
+            userMessageId: userMessageId,
+            mediaType: .image
+        )
+        let responseGroupId = responsePlan.responseGroupId
+        let messageIds = responsePlan.messageIDsByModel
 
-        for model in models {
-            let messageId = UUID()
-            messageIds[model] = messageId
-
-            let placeholderMessage = Message(
-                id: messageId,
-                role: .assistant,
-                content: "",
-                model: model,
-                responseGroupId: responseGroupId,
-                mediaType: .image
-            )
+        for placeholderMessage in responsePlan.placeholderMessages {
             conversationManager.addMessage(to: conversation, message: placeholderMessage)
-            responseEntries.append(ResponseGroup.ResponseEntry(
-                id: messageId,
-                modelName: model,
-                status: .streaming
-            ))
         }
 
-        let responseGroup = ResponseGroup(
-            id: responseGroupId,
-            userMessageId: conversation.messages.last(where: { $0.role == .user })?.id ?? UUID(),
-            responses: responseEntries
-        )
         if let index = conversationManager.conversations.firstIndex(where: { $0.id == conversation.id }) {
-            conversationManager.conversations[index].responseGroups.append(responseGroup)
+            conversationManager.conversations[index].responseGroups.append(responsePlan.responseGroup)
         }
 
         registerNewChatImageBatchCancellation(
@@ -925,30 +880,16 @@ struct MacNewChatView: View {
             return
         }
 
-        // Create response group
-        let responseGroupId = UUID()
-        var responseGroup = ResponseGroup(id: responseGroupId, userMessageId: userMessageId)
-
-        // Create placeholder messages for each model
-        let messageIds = Dictionary(uniqueKeysWithValues: models.map { ($0, UUID()) })
-        for model in models {
-            guard let messageId = messageIds[model] else { continue }
-            responseGroup.addResponse(messageId: messageId, modelName: model, status: .streaming)
-
-            let placeholderMessage = Message(
-                id: messageId,
-                role: .assistant,
-                content: "",
-                model: model,
-                responseGroupId: responseGroupId
-            )
+        let responsePlan = MultiModelResponsePlan(models: models, userMessageId: userMessageId)
+        let responseGroupId = responsePlan.responseGroupId
+        for placeholderMessage in responsePlan.placeholderMessages {
             conversationManager.addMessage(to: updatedConversation, message: placeholderMessage)
         }
 
         // Add response group to conversation
-        conversationManager.addResponseGroup(to: updatedConversation, group: responseGroup)
+        conversationManager.addResponseGroup(to: updatedConversation, group: responsePlan.responseGroup)
 
-        let messageIdsByModel = messageIds
+        let messageIdsByModel = responsePlan.messageIDsByModel
 
         // Prepare messages for API
         var messagesToSend = updatedConversation.getEffectiveHistory()
@@ -962,6 +903,7 @@ struct MacNewChatView: View {
             activeAssistantMessageID = nil
             activeMultiModelResponseGroupID = responseGroupId
             let operationID = coordinator.beginOperation(conversationID: conversationId)
+            multiModelReasoningBuffer.resetAll()
             let request = aiService.sendToMultipleModels(
             messages: messagesToSend,
             models: models,
@@ -985,6 +927,7 @@ struct MacNewChatView: View {
             onModelComplete: { model in
                     coordinator.enqueueCallback(for: operationID, conversationID: conversationId) {
                     guard let messageId = messageIdsByModel[model] else { return }
+                        multiModelReasoningBuffer.finish(for: messageId)
 
                         updateResponseGroupViaGroup(
                             conversationId: conversationId,
@@ -998,6 +941,7 @@ struct MacNewChatView: View {
             onAllComplete: {
                     coordinator.enqueueCallback(for: operationID, conversationID: conversationId) {
                         guard coordinator.owns(operationID, conversationID: conversationId) else { return }
+                    multiModelReasoningBuffer.finishAll()
                     isGenerating = false
                     logNewChat("🏁 All models completed", level: .info)
 
@@ -1017,6 +961,7 @@ struct MacNewChatView: View {
             onError: { model, error in
                     coordinator.enqueueCallback(for: operationID, conversationID: conversationId) {
                     guard let messageId = messageIdsByModel[model] else { return }
+                        multiModelReasoningBuffer.finish(for: messageId)
 
                         updateResponseGroupViaGroup(
                             conversationId: conversationId,
@@ -1037,9 +982,37 @@ struct MacNewChatView: View {
                         shouldOfferOpenSettings = ErrorPresenter.suggestedAction(for: error) == .openSettings
                     }
                 }
+            },
+            onPendingToolCall: nil,
+            onReasoning: { model, reasoning in
+                coordinator.enqueueCallback(for: operationID, conversationID: conversationId) {
+                    guard !reasoning.isEmpty,
+                          let messageId = messageIdsByModel[model]
+                    else { return }
+
+                    let conversationManager = conversationManager
+                    multiModelReasoningBuffer.buffer(for: messageId) { reasoningChunk in
+                        guard conversationManager.updateMessage(
+                            conversationId: conversationId,
+                            messageId: messageId,
+                            update: { message in
+                                message.reasoning = (message.reasoning ?? "") + reasoningChunk
+                            }
+                        ) else {
+                            return
+                        }
+                        if let conversation = conversationManager.conversation(byId: conversationId) {
+                            conversationManager.save(conversation)
+                        }
+                    }.append(reasoning)
+                }
             }
         )
             coordinator.onCancel(for: operationID) {
+                multiModelReasoningBuffer.finishAll()
+                if let conversation = conversationManager.conversation(byId: conversationId) {
+                    conversationManager.saveImmediately(conversation)
+                }
                 request.cancel()
             }
     }

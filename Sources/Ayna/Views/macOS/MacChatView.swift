@@ -159,6 +159,7 @@ struct MacChatView: View {
         @State var toolChainCoordinator = ToolChainCoordinator()
         @State private var toolCallRequestRoundCoordinator = ToolCallRequestRoundCoordinator<ToolExecutionResult>()
     @State var imageGenerationCoordinator = ImageGenerationCoordinator()
+    @State var multiModelReasoningBuffer = MultiModelStreamingBuffer()
     @State private var showingSystemPromptSheet = false
 
     // Multi-model support (unified selection - 1 model = single, 2+ = multi)
@@ -179,9 +180,8 @@ struct MacChatView: View {
     // Performance optimizations
     @State private var pendingChunks: [String] = []
     @State private var batchUpdateTask: Task<Void, Never>?
-    @State private var visibleMessages: [Message] = []
     @State private var cachedConversationIndex: Int?
-    @State private var cachedDisplayableItems: [DisplayableItem] = []
+    @State private var cachedDisplayableItems: [ChatTranscriptItem] = []
     /// Cache the current conversation to avoid repeated lookups
     var currentConversation: Conversation {
         if let index = getConversationIndex() {
@@ -215,31 +215,12 @@ struct MacChatView: View {
         DiagnosticsLogger.log(.chatView, level: level, message: message, metadata: combinedMetadata)
     }
 
-    /// Helper to filter visible messages
-    private func updateVisibleMessages() {
-        visibleMessages = currentConversation.messages.filter { message in
-            MacChatMessagePresentation.isVisible(
-                message,
-                lastMessageID: currentConversation.messages.last?.id,
-                isGenerating: isGenerating
-            )
-        }
-
-        // Update displayable items after visible messages change
-        updateDisplayableItems()
-    }
-
-    // MARK: - Multi-Model Display
-
-    /// Updates cached displayable items. Call when messages change or isGenerating changes.
-    private func updateDisplayableItems() {
-        cachedDisplayableItems = DisplayableMessageGrouper.displayableItems(
-            from: visibleMessages,
-            makeMessage: { .message($0) },
-            makeResponseGroup: { groupId, responses in
-                .responseGroup(groupId: groupId, responses: responses)
-            }
-        )
+    /// Updates cached transcript items when messages, response groups, or generation state change.
+    private func updateTranscriptPlan() {
+        cachedDisplayableItems = ChatTranscriptPlan(
+            conversation: currentConversation,
+            isGenerating: isGenerating
+        ).items
     }
 
     private var normalizedSelectedModel: String {
@@ -306,21 +287,22 @@ struct MacChatView: View {
                         }
                     },
                     onAppearAction: {
-                        updateVisibleMessages()
+                        updateTranscriptPlan()
                         syncSelectedModelWithConversation()
                     },
                     onConversationChange: {
-                        updateVisibleMessages()
+                        updateTranscriptPlan()
                         syncSelectedModelWithConversation()
                     },
                     onMessagesChange: {
-                        updateVisibleMessages()
+                        updateTranscriptPlan()
                     },
                     onModelChange: {
+                        updateTranscriptPlan()
                         syncSelectedModelWithConversation()
                     },
                     onGeneratingChange: {
-                        updateVisibleMessages()
+                        updateTranscriptPlan()
                     }
                 )
 
@@ -689,30 +671,17 @@ struct MacChatView: View {
 
     /// Auto-select response if we are continuing from a multi-model state without selection
     private func autoSelectResponseIfNeeded() {
-        guard let lastMessage = currentConversation.messages.last,
-              let groupId = lastMessage.responseGroupId,
-              let group = currentConversation.getResponseGroup(groupId),
-              group.selectedResponseId == nil
-        else {
-            return
-        }
+        guard let selection = ChatTranscriptPlan.autoSelectionCandidate(in: currentConversation) else { return }
 
-        let responses = currentConversation.messages.filter { $0.responseGroupId == groupId }
-        var candidateId: UUID?
-
-        // 1. Primary: conversation.model
-        if let match = responses.first(where: { $0.model == currentConversation.model }) {
-            candidateId = match.id
-        }
-        // 2. Fallback: First model
-        else if let first = responses.first {
-            candidateId = first.id
-        }
-
-        if let id = candidateId {
-            logChat("🤖 Auto-selecting response before sending new message", metadata: ["messageId": id.uuidString])
-            conversationManager.selectResponse(in: currentConversation, groupId: groupId, messageId: id)
-        }
+        logChat(
+            "🤖 Auto-selecting response before sending new message",
+            metadata: ["messageId": selection.messageId.uuidString]
+        )
+        conversationManager.selectResponse(
+            in: currentConversation,
+            groupId: selection.groupId,
+            messageId: selection.messageId
+        )
     }
 
     // MARK: - Error Handling
@@ -766,7 +735,8 @@ struct MacChatView: View {
 
             let assistantMessageID = activeAssistantMessageID
             let responseGroupID = activeMultiModelResponseGroupID
-            guard assistantMessageID != nil || responseGroupID != nil || !pendingText.isEmpty,
+            let flushedReasoning = multiModelReasoningBuffer.finishAll()
+            guard assistantMessageID != nil || responseGroupID != nil || !pendingText.isEmpty || flushedReasoning,
                   let conversationIndex = conversationManager.conversations.firstIndex(where: { $0.id == conversation.id })
             else {
                 activeMultiModelResponseGroupID = nil
