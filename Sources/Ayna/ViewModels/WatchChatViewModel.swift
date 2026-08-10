@@ -1,3 +1,4 @@
+// swiftlint:disable file_length
 //
 //  WatchChatViewModel.swift
 //  Ayna Watch App
@@ -150,6 +151,7 @@ enum WatchLiveModelPolicy {
             let isFirstMessage: Bool
             let userContent: String
             let finalContent: String
+            let finalReasoning: String
         }
 
         private enum DraftFinalizationOutcome: Equatable {
@@ -192,6 +194,7 @@ enum WatchLiveModelPolicy {
         private var lastUIUpdateTime: Date = .distantPast
         private let uiUpdateInterval: TimeInterval = 0.1 // 100ms throttle
         private var pendingContent = ""
+        private var pendingReasoning = ""
 
         init(
             conversationStore: WatchConversationStore = .shared,
@@ -220,6 +223,7 @@ enum WatchLiveModelPolicy {
             failedMessage = nil
             pendingUserMessageId = nil
             pendingContent = ""
+            pendingReasoning = ""
             restorePendingResponsePromotionState(for: id)
         }
 
@@ -257,6 +261,7 @@ enum WatchLiveModelPolicy {
             isStreaming = false
             streamingContent = ""
             pendingContent = ""
+            pendingReasoning = ""
             currentToolName = nil
             toolCallDepth = 0
             lastUIUpdateTime = .distantPast
@@ -428,13 +433,11 @@ enum WatchLiveModelPolicy {
 
                         let now = Date()
                         if now.timeIntervalSince(self.lastUIUpdateTime) >= self.uiUpdateInterval {
-                            self.streamingContent = self.pendingContent
-                            self.updateAssistantMessage(
-                                assistantMessageId,
-                                in: conversationId,
-                                content: self.streamingContent
+                            self.publishPendingResponse(
+                                assistantMessageId: assistantMessageId,
+                                conversationId: conversationId,
+                                at: now
                             )
-                            self.lastUIUpdateTime = now
                         }
                         self.currentToolName = nil
                     }
@@ -560,7 +563,26 @@ enum WatchLiveModelPolicy {
                         )
                     }
                 },
-                onReasoning: nil
+                onReasoning: { [weak self] reasoning in
+                    coordinator.enqueueCallback(for: operationID, conversationID: conversationId) { [weak self] in
+                        guard let self,
+                              coordinator.owns(operationID, conversationID: conversationId),
+                              self.activeAssistantMessageId == assistantMessageId
+                        else {
+                            return
+                        }
+                        self.isStreaming = true
+                        self.pendingReasoning += reasoning
+                        let now = Date()
+                        if now.timeIntervalSince(self.lastUIUpdateTime) >= self.uiUpdateInterval {
+                            self.publishPendingResponse(
+                                assistantMessageId: assistantMessageId,
+                                conversationId: conversationId,
+                                at: now
+                            )
+                        }
+                    }
+                }
             )
             coordinator.onCancel(for: operationID) {
                 request.cancel()
@@ -702,7 +724,7 @@ enum WatchLiveModelPolicy {
                 return
             }
 
-            guard flushPendingContent(
+            guard flushPendingResponse(
                 assistantMessageId: assistantMessageId,
                 conversationId: conversationId
             ) else {
@@ -712,7 +734,8 @@ enum WatchLiveModelPolicy {
                         assistantMessageId: assistantMessageId,
                         conversationId: conversationId,
                         userContent: userContent,
-                        finalContent: pendingContent
+                        finalContent: pendingContent,
+                        finalReasoning: pendingReasoning
                     ),
                     retryPromotion: true
                 )
@@ -769,6 +792,7 @@ enum WatchLiveModelPolicy {
             let continuationMessages = Array(updatedConversation.effectiveHistory.dropLast())
             streamingContent = ""
             pendingContent = ""
+            pendingReasoning = ""
             currentToolName = nil
             lastUIUpdateTime = .distantPast
             sendMessageWithToolSupport(
@@ -804,17 +828,19 @@ enum WatchLiveModelPolicy {
                     userMessageID: pendingUserMessageId,
                     isFirstMessage: isFirstMessage,
                     userContent: userContent,
-                    finalContent: pendingContent
+                    finalContent: pendingContent,
+                    finalReasoning: pendingReasoning
                 )
             )
         }
 
         @discardableResult
         private func attemptResponsePromotion(_ pending: PendingResponsePromotion) -> Bool {
-            guard flushPendingContent(
+            guard flushPendingResponse(
                 assistantMessageId: pending.assistantMessageID,
                 conversationId: pending.conversationID,
-                finalContent: pending.finalContent
+                finalContent: pending.finalContent,
+                finalReasoning: pending.finalReasoning
             ) else {
                 failResponsePromotion(pending, retryPromotion: true)
                 return false
@@ -846,6 +872,8 @@ enum WatchLiveModelPolicy {
             toolCallDepth = 0
             errorMessage = nil
             failedMessage = nil
+            pendingContent = ""
+            pendingReasoning = ""
             playHaptic(.success)
 
             if pending.isFirstMessage, conversation.title == "New Chat" {
@@ -918,7 +946,7 @@ enum WatchLiveModelPolicy {
                 return
             }
             toolChainCoordinator.cancelCurrentOperation()
-            guard flushPendingContent(
+            guard flushPendingResponse(
                 assistantMessageId: assistantMessageId,
                 conversationId: conversationId
             ) else {
@@ -927,7 +955,8 @@ enum WatchLiveModelPolicy {
                         assistantMessageId: assistantMessageId,
                         conversationId: conversationId,
                         userContent: userContent,
-                        finalContent: pendingContent
+                        finalContent: pendingContent,
+                        finalReasoning: pendingReasoning
                     ),
                     retryPromotion: true
                 )
@@ -992,21 +1021,37 @@ enum WatchLiveModelPolicy {
                 message: "⌚ Max tool call depth reached"
             )
             toolChainCoordinator.cancelCurrentOperation()
-            activeAssistantMessageId = nil
-            isLoading = false
-            isStreaming = false
-            currentToolName = nil
-            toolCallDepth = 0
-            errorMessage = "Tool call limit reached. Please try again."
+            guard flushPendingResponse(
+                assistantMessageId: assistantMessageId,
+                conversationId: conversationId
+            ) else {
+                failResponsePromotion(
+                    makePendingResponsePromotion(
+                        assistantMessageId: assistantMessageId,
+                        conversationId: conversationId,
+                        userContent: userContent,
+                        finalContent: pendingContent,
+                        finalReasoning: pendingReasoning
+                    ),
+                    retryPromotion: true
+                )
+                return
+            }
             let finalizationOutcome = finalizeDraftIfNeeded(
                 assistantMessageId: assistantMessageId,
                 conversationId: conversationId,
                 userContent: userContent
             )
+            activeAssistantMessageId = nil
+            isLoading = false
+            isStreaming = false
+            currentToolName = nil
+            toolCallDepth = 0
             if finalizationOutcome != .promotionPending {
                 pendingUserMessageId = nil
+                errorMessage = "Tool call limit reached. Please try again."
+                playHaptic(.failure)
             }
-            playHaptic(.failure)
         }
 
         private func stopToolChainForMissingConversation(
@@ -1032,6 +1077,7 @@ enum WatchLiveModelPolicy {
             currentToolName = nil
             toolCallDepth = 0
             pendingContent = ""
+            pendingReasoning = ""
             if finalizationOutcome != .promotionPending {
                 errorMessage = "Failed to update conversation. Please try again."
                 failedMessage = userContent
@@ -1061,15 +1107,39 @@ enum WatchLiveModelPolicy {
         private func updateAssistantMessage(
             _ messageId: UUID,
             in conversationId: UUID,
-            content: String
+            content: String? = nil,
+            reasoning: String? = nil
         ) -> Bool {
+            guard content != nil || reasoning != nil else { return true }
             guard var conversation = conversationStore.conversation(for: conversationId),
                   let messageIndex = conversation.messages.firstIndex(where: { $0.id == messageId })
             else {
                 return false
             }
-            conversation.messages[messageIndex].content = content
+            if let content {
+                conversation.messages[messageIndex].content = content
+            }
+            if let reasoning {
+                conversation.messages[messageIndex].reasoning = reasoning
+            }
             return conversationStore.replaceConversation(conversation)
+        }
+
+        private func publishPendingResponse(
+            assistantMessageId: UUID,
+            conversationId: UUID,
+            at updateTime: Date
+        ) {
+            if !pendingContent.isEmpty {
+                streamingContent = pendingContent
+            }
+            updateAssistantMessage(
+                assistantMessageId,
+                in: conversationId,
+                content: pendingContent.isEmpty ? nil : pendingContent,
+                reasoning: pendingReasoning.isEmpty ? nil : pendingReasoning
+            )
+            lastUIUpdateTime = updateTime
         }
 
         /// Cancel active request work without discarding a completed response promotion retry.
@@ -1085,6 +1155,7 @@ enum WatchLiveModelPolicy {
             toolCallDepth = 0
             if !hasPendingResponsePromotionForCurrentConversation {
                 pendingContent = ""
+                pendingReasoning = ""
                 playHaptic(.click)
             }
         }
@@ -1104,6 +1175,7 @@ enum WatchLiveModelPolicy {
             toolCallDepth = 0
             if !hasPendingResponsePromotionForCurrentConversation {
                 pendingContent = ""
+                pendingReasoning = ""
             }
             return true
         }
@@ -1118,7 +1190,7 @@ enum WatchLiveModelPolicy {
             else {
                 return
             }
-            guard flushPendingContent(
+            guard flushPendingResponse(
                 assistantMessageId: assistantMessageId,
                 conversationId: conversationId
             ) else {
@@ -1126,7 +1198,8 @@ enum WatchLiveModelPolicy {
                     makePendingResponsePromotion(
                         assistantMessageId: assistantMessageId,
                         conversationId: conversationId,
-                        finalContent: pendingContent
+                        finalContent: pendingContent,
+                        finalReasoning: pendingReasoning
                     ),
                     retryPromotion: true
                 )
@@ -1154,10 +1227,12 @@ enum WatchLiveModelPolicy {
                 assistantMessageId: assistantMessageId,
                 conversationId: conversationId,
                 userContent: userContent,
-                finalContent: message.content
+                finalContent: message.content,
+                finalReasoning: message.reasoning ?? ""
             )
 
             let hasAssistantState = !message.content.isEmpty ||
+                !(message.reasoning?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) ||
                 !(message.citations?.isEmpty ?? true) ||
                 !(message.toolCalls?.isEmpty ?? true)
             let turnStartIndex = conversation.messages[...messageIndex].lastIndex {
@@ -1193,7 +1268,8 @@ enum WatchLiveModelPolicy {
             assistantMessageId: UUID,
             conversationId: UUID,
             userContent: String? = nil,
-            finalContent: String
+            finalContent: String,
+            finalReasoning: String
         ) -> PendingResponsePromotion {
             let conversation = conversationStore.conversation(for: conversationId)
             let messageIndex = conversation?.messages.firstIndex { $0.id == assistantMessageId }
@@ -1208,34 +1284,43 @@ enum WatchLiveModelPolicy {
                 userMessageID: userMessageID,
                 isFirstMessage: isFirstMessage,
                 userContent: userContent ?? userMessage?.content ?? failedMessage ?? "",
-                finalContent: finalContent
+                finalContent: finalContent,
+                finalReasoning: finalReasoning
             )
         }
 
         @discardableResult
-        private func flushPendingContent(
+        private func flushPendingResponse(
             assistantMessageId: UUID? = nil,
             conversationId: UUID? = nil,
-            finalContent: String? = nil
+            finalContent: String? = nil,
+            finalReasoning: String? = nil
         ) -> Bool {
             let content = finalContent ?? pendingContent
-            guard !content.isEmpty else { return true }
+            let reasoning = finalReasoning ?? pendingReasoning
+            guard !content.isEmpty || !reasoning.isEmpty else { return true }
             guard let conversationId = conversationId ?? currentConversationId,
                   let assistantMessageId = assistantMessageId ?? activeAssistantMessageId
             else {
                 return false
             }
 
-            streamingContent = content
+            if !content.isEmpty {
+                streamingContent = content
+            }
             guard updateAssistantMessage(
                 assistantMessageId,
                 in: conversationId,
-                content: content
+                content: content.isEmpty ? nil : content,
+                reasoning: reasoning.isEmpty ? nil : reasoning
             ) else {
                 return false
             }
             if pendingContent == content {
                 pendingContent = ""
+            }
+            if pendingReasoning == reasoning {
+                pendingReasoning = ""
             }
             return true
         }
