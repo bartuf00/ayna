@@ -4,7 +4,7 @@ import Foundation
 import Testing
 
 // swiftlint:disable identifier_name
-@Suite("ConversationManager Tests", .tags(.viewModel, .persistence))
+@Suite("ConversationManager Tests", .tags(.viewModel, .persistence), .serialized)
 // swiftlint:disable:next type_body_length
 struct ConversationManagerTests {
     private var defaults: UserDefaults
@@ -108,6 +108,84 @@ struct ConversationManagerTests {
 
         #expect(manager.conversations.first?.messages.count == 1)
         #expect(manager.conversations.first?.messages.first?.content == "Ping")
+    }
+
+    @Test
+    @MainActor
+    func `begin multi-model response returns the updated retry history`() throws {
+        let directory = try TestHelpers.makeTemporaryDirectory()
+        let manager = makeManager(directory: directory)
+        let user = Message(role: .user, content: "Question")
+        let failedGroupID = UUID()
+        let failedPartial = Message(
+            role: .assistant,
+            content: "Failed partial",
+            responseGroupId: failedGroupID
+        )
+        let failedGroup = ResponseGroup(
+            id: failedGroupID,
+            userMessageId: user.id,
+            responses: [.init(id: failedPartial.id, modelName: "model-a", status: .failed)]
+        )
+        let conversation = Conversation(
+            messages: [user, failedPartial],
+            responseGroups: [failedGroup]
+        )
+        manager.conversations = [conversation]
+
+        let responsePlan = MultiModelResponsePlan(models: ["model-a"], userMessageId: user.id)
+        let updated = try #require(manager.beginMultiModelResponse(
+            to: conversation,
+            messages: responsePlan.placeholderMessages,
+            responseGroup: responsePlan.responseGroup
+        ))
+
+        #expect(updated == manager.conversation(byId: conversation.id))
+        #expect(updated.responseGroups.map(\.id) == [responsePlan.responseGroup.id])
+        #expect(!updated.messages.contains { $0.id == failedPartial.id })
+        #expect(updated.messages.contains { $0.responseGroupId == responsePlan.responseGroup.id })
+    }
+
+    @Test
+    @MainActor
+    func `attachment-only first message uses stable image title without AI generation`() async throws {
+        let previousAutoGenerateTitle = defaults.object(forKey: "autoGenerateTitle")
+        defaults.set(true, forKey: "autoGenerateTitle")
+        let previousSelectedModel = AIService.shared.selectedModel
+        AIService.shared.selectedModel = ""
+        defer {
+            if let previousAutoGenerateTitle {
+                defaults.set(previousAutoGenerateTitle, forKey: "autoGenerateTitle")
+            } else {
+                defaults.removeObject(forKey: "autoGenerateTitle")
+            }
+            AIService.shared.selectedModel = previousSelectedModel
+        }
+
+        let directory = try TestHelpers.makeTemporaryDirectory()
+        let manager = makeManager(directory: directory)
+        manager.createNewConversation()
+        let conversation = try #require(manager.conversations.first)
+        var message = Message(role: .user, content: "")
+        message.attachments = [
+            Message.FileAttachment(
+                fileName: "pasted-image.png",
+                mimeType: "image/png",
+                data: Data([0x89]),
+                localPath: nil
+            ),
+        ]
+
+        manager.addMessage(to: conversation, message: message)
+
+        let fallbackTitle = try #require(manager.conversation(byId: conversation.id)?.title)
+        #expect(fallbackTitle == "Image")
+        #expect(!fallbackTitle.isEmpty)
+
+        for _ in 0 ..< 10 {
+            await Task.yield()
+        }
+        #expect(manager.conversation(byId: conversation.id)?.title == fallbackTitle)
     }
 
     @Test

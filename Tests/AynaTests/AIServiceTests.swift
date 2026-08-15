@@ -35,6 +35,191 @@ extension AIServiceGlobalStateTests {
         }
 
         @Test
+        func `Anthropic image limit is validated across request history`() {
+            let service = makeService()
+            let anthropicModel = "claude-test"
+            let openAIModel = "openai-test"
+            service.modelProviders[anthropicModel] = .anthropic
+            service.modelProviders[openAIModel] = .openai
+            let attachment = Message.FileAttachment(
+                fileName: "image.png",
+                mimeType: "image/png",
+                data: Data([0x89, 0x50, 0x4E, 0x47])
+            )
+            let allowed = Message(
+                role: .user,
+                content: "",
+                attachments: Array(
+                    repeating: attachment,
+                    count: AnthropicRequestBuilder.maxImagesPerRequest
+                )
+            )
+            let exceeding = Message(
+                role: .user,
+                content: "",
+                attachments: Array(
+                    repeating: attachment,
+                    count: AnthropicRequestBuilder.maxImagesPerRequest + 1
+                )
+            )
+            let retried = Message(
+                role: .user,
+                content: "Retry",
+                attachments: Array(repeating: attachment, count: 11)
+            )
+            let retryHistory = ChatDraftContent.messagesByIncludingUserMessageIfNeeded(
+                retried,
+                in: [retried]
+            )
+            let unsupportedLabeledImages = Message(
+                role: .user,
+                content: "",
+                attachments: Array(
+                    repeating: Message.FileAttachment(
+                        fileName: "image.heic",
+                        mimeType: "image/heic",
+                        data: Data(repeating: 0, count: 12)
+                    ),
+                    count: AnthropicRequestBuilder.maxImagesPerRequest + 1
+                )
+            )
+
+            #expect(service.attachmentImageLimitError(
+                for: [anthropicModel],
+                messages: [allowed]
+            ) == nil)
+            #expect(service.attachmentImageLimitError(
+                for: [anthropicModel],
+                messages: [exceeding]
+            ) == "Anthropic supports at most 20 images per request. Remove some images or start a new conversation.")
+            #expect(service.attachmentImageLimitError(
+                for: [openAIModel],
+                messages: [exceeding]
+            ) == nil)
+            #expect(retryHistory.first?.attachments?.count == 11)
+            #expect(service.attachmentImageLimitError(
+                for: [anthropicModel],
+                messages: retryHistory
+            ) == nil)
+            #expect(service.attachmentImageLimitError(
+                for: [anthropicModel],
+                messages: [unsupportedLabeledImages]
+            ) == "Anthropic supports at most 20 images per request. Remove some images or start a new conversation.")
+        }
+
+        @Test
+        func `Apple Intelligence attachment history is rejected before dispatch`() {
+            let service = makeService()
+            let appleModel = "apple-test"
+            let openAIModel = "openai-test"
+            service.modelProviders[appleModel] = .appleIntelligence
+            service.modelProviders[openAIModel] = .openai
+            let imageMessage = Message(
+                role: .user,
+                content: "",
+                attachments: [Message.FileAttachment(
+                    fileName: "image.png",
+                    mimeType: "image/png",
+                    data: Data([0x89, 0x50, 0x4E, 0x47])
+                )]
+            )
+
+            #expect(service.attachmentHistorySupportError(
+                for: [appleModel],
+                messages: [imageMessage, Message(role: .user, content: "Continue")]
+            ) == "Apple Intelligence does not support attachments. Choose a vision-capable cloud model.")
+            #expect(service.attachmentHistorySupportError(
+                for: [openAIModel],
+                messages: [imageMessage]
+            ) == nil)
+            #expect(service.attachmentHistorySupportError(
+                for: [appleModel],
+                messages: [Message(role: .user, content: "Text only")]
+            ) == nil)
+        }
+
+        @Test
+        func `provider image bytes are validated before request dispatch`() async throws {
+            let service = makeService()
+            let anthropicModel = "claude-test"
+            let openAIModel = "openai-test"
+            service.modelProviders[anthropicModel] = .anthropic
+            service.modelProviders[openAIModel] = .openai
+            let validPNGData = try #require(Data(base64Encoded:
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="))
+
+            var oversizedJPEG = Data([0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0, 0, 0, 0, 0])
+            oversizedJPEG.append(Data(
+                repeating: 0,
+                count: AnthropicRequestBuilder.maxImageSizeBytes
+            ))
+            let oversizedImageData = oversizedJPEG
+            let inlineAttachment = Message.FileAttachment(
+                fileName: "large.jpg",
+                mimeType: "image/jpeg",
+                data: oversizedImageData
+            )
+            let storedAttachment = Message.FileAttachment(
+                fileName: "stored.jpg",
+                mimeType: "image/jpeg",
+                localPath: "stored.jpg"
+            )
+            let unsupportedAttachment = Message.FileAttachment(
+                fileName: "photo.heic",
+                mimeType: "image/heic",
+                data: Data(repeating: 0, count: 12)
+            )
+            let validAttachment = Message.FileAttachment(
+                fileName: "valid.png",
+                mimeType: "image/png",
+                data: validPNGData
+            )
+            let mismatchedAttachment = Message.FileAttachment(
+                fileName: "renamed.jpg",
+                mimeType: "image/jpeg",
+                data: validPNGData
+            )
+            #expect(await service.attachmentImageValidationError(
+                for: [anthropicModel],
+                inMemoryAttachments: [inlineAttachment]
+            )?.contains("Image too large") == true)
+            #expect(await service.attachmentImageValidationError(
+                for: [anthropicModel],
+                inMemoryAttachments: [unsupportedAttachment]
+            )?.contains("Unsupported image format") == true)
+            #expect(await service.attachmentImageValidationError(
+                for: [anthropicModel],
+                loading: [storedAttachment],
+                loadAttachmentData: { path in
+                    path == "stored.jpg" ? oversizedImageData : nil
+                }
+            )?.contains("Image too large") == true)
+            #expect(await service.attachmentImageValidationError(
+                for: [anthropicModel],
+                in: [Message(
+                    role: .user,
+                    content: "Earlier image",
+                    attachments: [storedAttachment]
+                )],
+                loadAttachmentData: { path in
+                    path == "stored.jpg" ? oversizedImageData : nil
+                }
+            )?.contains("Image too large") == true)
+            #expect(await service.attachmentImageValidationError(
+                for: [openAIModel],
+                inMemoryAttachments: [inlineAttachment]
+            )?.contains("invalid or corrupted") == true)
+            #expect(await service.attachmentImageValidationError(
+                for: [openAIModel],
+                inMemoryAttachments: [validAttachment]
+            ) == nil)
+            #expect(await service.attachmentImageValidationError(
+                for: [openAIModel],
+                inMemoryAttachments: [mismatchedAttachment]
+            )?.contains("does not match") == true)
+        }
+
+        @Test
         func `An unrecognized default provider cannot route inherited models`() throws {
             let inheritedModel = "future-inherited"
             let explicitModel = "valid-explicit"

@@ -2746,32 +2746,19 @@ final class ConversationManager: ObservableObject {
         }
     }
 
-    /// Adds multiple messages and a response group atomically.
-    /// This ensures the UI updates once with all data ready, preventing visual glitches
-    /// where multi-model responses appear as separate messages briefly.
-    func addMultiModelResponse(
+    /// Starts or retries a multi-model response as one conversation mutation.
+    func beginMultiModelResponse(
         to conversation: Conversation,
         messages: [Message],
         responseGroup: ResponseGroup
-    ) {
-        if let index = conversations.firstIndex(where: { $0.id == conversation.id }) {
-            // Add all messages
-            for message in messages {
-                conversations[index].messages.append(message)
-            }
-            // Add the response group
-            conversations[index].addResponseGroup(responseGroup)
-            conversations[index].updatedAt = Date()
-            save(conversations[index])
-        }
-    }
+    ) -> Conversation? {
+        guard let index = getConversationIndex(for: conversation.id) else { return nil }
 
-    /// Adds a response group to track parallel responses
-    func addResponseGroup(to conversation: Conversation, group: ResponseGroup) {
-        if let index = getConversationIndex(for: conversation.id) {
-            conversations[index].addResponseGroup(group)
-            save(conversations[index])
-        }
+        conversations[index].removeFailedResponseGroups(for: responseGroup.userMessageId)
+        conversations[index].messages.append(contentsOf: messages)
+        conversations[index].addResponseGroup(responseGroup)
+        save(conversations[index])
+        return conversations[index]
     }
 
     /// Updates a response group (e.g., when streaming completes)
@@ -2917,17 +2904,26 @@ final class ConversationManager: ObservableObject {
             return
         }
 
+        let content = firstMessage.content
+        if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let imageCount = firstMessage.attachments?.count(where: {
+                $0.mimeType.starts(with: "image/")
+            }) ?? 0
+            guard imageCount > 0 else { return }
+            let fallbackTitle = imageCount == 1 ? "Image" : "\(imageCount) Images"
+            renameConversation(conversation, newTitle: fallbackTitle)
+            return
+        }
+
         // Skip AI title generation for image generation models - use fallback instead
         let modelCapability = AIService.shared.getModelCapability(conversation.model)
         if modelCapability == .imageGeneration {
             // Use simple fallback title for image generation conversations
-            let content = firstMessage.content
             let fallbackTitle = String(content.prefix(50))
             renameConversation(conversation, newTitle: fallbackTitle + (content.count > 50 ? "..." : ""))
             return
         }
 
-        let content = firstMessage.content
         let titleRequestGeneration = beginTitleRequest(for: conversation.id)
         let firstMessageId = firstMessage.id
 

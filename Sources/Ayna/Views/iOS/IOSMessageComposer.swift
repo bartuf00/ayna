@@ -6,9 +6,11 @@
 //  Created on 11/24/25.
 //
 
+import ImageIO
 import os.log
 import PhotosUI
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 /// A reusable message composer component for iOS chat views.
@@ -20,6 +22,9 @@ struct IOSMessageComposer: View {
     @Binding var errorMessage: String?
     @Binding var attachedFiles: [URL]
     @Binding var attachedImages: [UIImage]
+    @Binding var pastedImages: [PastedImage]
+    @Binding var pasteImportSessionID: UUID
+    @Binding var isImportingPastedImages: Bool
 
     /// Optional recovery suggestion for the current error
     var errorRecoverySuggestion: String?
@@ -97,6 +102,9 @@ struct IOSMessageComposer: View {
         errorMessage: Binding<String?>,
         attachedFiles: Binding<[URL]> = .constant([]),
         attachedImages: Binding<[UIImage]> = .constant([]),
+        pastedImages: Binding<[PastedImage]> = .constant([]),
+        pasteImportSessionID: Binding<UUID>,
+        isImportingPastedImages: Binding<Bool>,
         errorRecoverySuggestion: String? = nil,
         onRetry: (() -> Void)? = nil,
         showAttachmentButton: Bool = true,
@@ -112,6 +120,9 @@ struct IOSMessageComposer: View {
         _errorMessage = errorMessage
         _attachedFiles = attachedFiles
         _attachedImages = attachedImages
+        _pastedImages = pastedImages
+        _pasteImportSessionID = pasteImportSessionID
+        _isImportingPastedImages = isImportingPastedImages
         self.errorRecoverySuggestion = errorRecoverySuggestion
         self.onRetry = onRetry
         self.showAttachmentButton = showAttachmentButton
@@ -141,7 +152,7 @@ struct IOSMessageComposer: View {
             }
 
             // Attached files display
-            if !attachedFiles.isEmpty || !attachedImages.isEmpty {
+            if !attachedFiles.isEmpty || !attachedImages.isEmpty || !pastedImages.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: Spacing.sm) {
                         ForEach(attachedFiles, id: \.self) { url in
@@ -149,6 +160,9 @@ struct IOSMessageComposer: View {
                         }
                         ForEach(attachedImages.indices, id: \.self) { index in
                             imageAttachmentChip(for: attachedImages[index], at: index)
+                        }
+                        ForEach(pastedImages) { pastedImage in
+                            pastedImageAttachmentChip(for: pastedImage)
                         }
                     }
                     .padding(.horizontal, Spacing.md)
@@ -191,22 +205,30 @@ struct IOSMessageComposer: View {
 
                 // Text field container - iMessage style pill with inline send button
                 HStack(alignment: .center, spacing: 0) {
-                    TextField("Ask anything", text: $messageText, axis: .vertical)
-                        .lineLimit(1 ... 5)
-                        .font(.body)
-                        .padding(.leading, 16)
-                        .padding(.trailing, 8)
-                        .padding(.vertical, 8)
-                        .accessibilityIdentifier("\(identifierPrefix).textEditor")
-                        .onSubmit {
-                            if !messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !isGenerating {
+                    IOSPasteAwareTextEditor(
+                        text: $messageText,
+                        pasteImportSessionID: $pasteImportSessionID,
+                        isImportingPastedImages: $isImportingPastedImages,
+                        remainingImageCapacity: { remainingImageCapacity },
+                        placeholder: "Ask anything",
+                        accessibilityIdentifier: "\(identifierPrefix).textEditor",
+                        onSubmit: {
+                            if canSend, !isGenerating {
                                 handleSendOrCancel()
                             }
+                        },
+                        onPasteImages: { images in
+                            pastedImages.append(contentsOf: images)
+                        },
+                        onPasteFailure: { message in
+                            errorMessage = message
                         }
-                        .submitLabel(.send)
+                    )
+                        .frame(maxWidth: .infinity)
+                        .accessibilityIdentifier("\(identifierPrefix).textEditor")
 
                     // Send/Stop button inside the text field - iMessage style
-                    if !messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isGenerating {
+                    if hasSendableContent || isGenerating {
                         Button(action: handleSendOrCancel) {
                             Image(systemName: isGenerating ? "stop.circle.fill" : "arrow.up.circle.fill")
                                 .font(.system(size: 26))
@@ -214,6 +236,7 @@ struct IOSMessageComposer: View {
                                 .symbolEffect(.pulse, options: .repeating, value: isGenerating)
                         }
                         .padding(.trailing, 5)
+                        .disabled(!isGenerating && !canSend)
                         .accessibilityLabel(isGenerating ? "Stop generating" : "Send message")
                         .accessibilityIdentifier("\(identifierPrefix).sendButton")
                         .transition(.scale.combined(with: .opacity))
@@ -224,7 +247,7 @@ struct IOSMessageComposer: View {
                 .clipShape(Capsule())
                 // Smooth spring animation when height changes from multiline text
                 .animation(Motion.springSnappy, value: messageText.contains("\n") || messageText.count > 40)
-                .animation(Motion.springSnappy, value: !messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isGenerating)
+                .animation(Motion.springSnappy, value: hasSendableContent || isGenerating)
             }
             .padding(.horizontal, Spacing.md)
         }
@@ -279,6 +302,47 @@ struct IOSMessageComposer: View {
         .accessibilityIdentifier("\(identifierPrefix).attachment.image\(index)")
     }
 
+    private func pastedImageAttachmentChip(for pastedImage: PastedImage) -> some View {
+        HStack(spacing: Spacing.xxs) {
+            IOSPastedImageThumbnail(pastedImage: pastedImage)
+            Text("Pasted image")
+                .font(Typography.caption)
+                .lineLimit(1)
+            Button {
+                pastedImages.removeAll { $0.id == pastedImage.id }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(Typography.caption)
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            .accessibilityIdentifier("\(identifierPrefix).attachment.remove.\(pastedImage.id.uuidString)")
+            .accessibilityLabel("Remove pasted image")
+        }
+        .padding(Spacing.xs)
+        .background(Theme.backgroundSecondary)
+        .clipShape(RoundedRectangle(cornerRadius: Spacing.CornerRadius.md))
+        .accessibilityIdentifier("\(identifierPrefix).attachment.\(pastedImage.id.uuidString)")
+    }
+
+    private var hasSendableContent: Bool {
+        ChatDraftContent.isSendable(
+            text: messageText,
+            fileURLs: attachedFiles,
+            inMemoryImageCount: attachedImages.count + pastedImages.count
+        )
+    }
+
+    private var canSend: Bool {
+        hasSendableContent && !isImportingPastedImages
+    }
+
+    private var remainingImageCapacity: Int {
+        ChatDraftContent.remainingImageCapacity(
+            fileURLs: attachedFiles,
+            inMemoryImageCount: attachedImages.count + pastedImages.count
+        )
+    }
+
     private func handleSendOrCancel() {
         if isGenerating {
             // Use centralized haptic engine
@@ -291,6 +355,7 @@ struct IOSMessageComposer: View {
             )
             onCancel()
         } else {
+            guard canSend else { return }
             // Use centralized haptic engine
             HapticEngine.sendButtonTap()
 
@@ -302,6 +367,445 @@ struct IOSMessageComposer: View {
             )
             onSend()
         }
+    }
+}
+
+private struct IOSPastedImageThumbnail: View {
+    let pastedImage: PastedImage
+
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            } else {
+                Image(systemName: "photo")
+            }
+        }
+        .frame(width: 24, height: 24)
+        .accessibilityHidden(true)
+        .task(id: pastedImage.id) {
+            let data = pastedImage.data
+            let thumbnail = await Task.detached(priority: .utility) { () -> CGImage? in
+                guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+                    return nil
+                }
+                let options: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 96,
+                    kCGImageSourceShouldCacheImmediately: true,
+                ]
+                return CGImageSourceCreateThumbnailAtIndex(
+                    source,
+                    0,
+                    options as CFDictionary
+                )
+            }.value
+            guard !Task.isCancelled, let thumbnail else { return }
+            image = UIImage(cgImage: thumbnail)
+        }
+    }
+}
+
+private struct IOSPasteAwareTextEditor: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var pasteImportSessionID: UUID
+    @Binding var isImportingPastedImages: Bool
+
+    let remainingImageCapacity: () -> Int
+    let placeholder: String
+    let accessibilityIdentifier: String
+    let onSubmit: () -> Void
+    let onPasteImages: ([PastedImage]) -> Void
+    let onPasteFailure: (String) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeUIView(context: Context) -> PasteAwareTextView {
+        let textView = PasteAwareTextView()
+        textView.delegate = context.coordinator
+        textView.backgroundColor = .clear
+        textView.font = .preferredFont(forTextStyle: .body)
+        textView.adjustsFontForContentSizeCategory = true
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isScrollEnabled = false
+        textView.returnKeyType = .send
+        textView.textContainerInset = UIEdgeInsets(top: 7, left: 16, bottom: 7, right: 8)
+        textView.textContainer.lineFragmentPadding = 0
+        textView.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        textView.accessibilityIdentifier = accessibilityIdentifier
+        textView.accessibilityLabel = placeholder
+        textView.placeholder = placeholder
+        configurePasteHandling(for: textView)
+        textView.onPasteFailure = onPasteFailure
+        textView.text = text
+        textView.updatePlaceholderVisibility()
+        return textView
+    }
+
+    func updateUIView(_ textView: PasteAwareTextView, context: Context) {
+        context.coordinator.parent = self
+        configurePasteHandling(for: textView)
+        textView.onPasteFailure = onPasteFailure
+        textView.placeholder = placeholder
+        textView.accessibilityLabel = placeholder
+        if textView.text != text {
+            textView.text = text
+        }
+        textView.updatePlaceholderVisibility()
+        textView.invalidateIntrinsicContentSize()
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        uiView: PasteAwareTextView,
+        context _: Context
+    ) -> CGSize? {
+        let width = proposal.width ?? 280
+        let fittingSize = uiView.sizeThatFits(CGSize(
+            width: width,
+            height: CGFloat.greatestFiniteMagnitude
+        ))
+        let lineHeight = uiView.font?.lineHeight ?? 20
+        let insets = uiView.textContainerInset.top + uiView.textContainerInset.bottom
+        let maximumHeight = ceil((lineHeight * 5) + insets)
+        let height = min(max(fittingSize.height, 34), maximumHeight)
+        uiView.isScrollEnabled = fittingSize.height > maximumHeight
+        return CGSize(width: width, height: height)
+    }
+
+    private func configurePasteHandling(for textView: PasteAwareTextView) {
+        let expectedSessionID = pasteImportSessionID
+        textView.updatePasteImportSession(expectedSessionID)
+        textView.remainingImageCapacity = remainingImageCapacity
+        textView.onPasteImages = { images in
+            guard pasteImportSessionID == expectedSessionID else { return }
+            onPasteImages(images)
+        }
+        textView.onPasteImportStateChange = { isImporting in
+            isImportingPastedImages = isImporting
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: IOSPasteAwareTextEditor
+
+        init(parent: IOSPasteAwareTextEditor) {
+            self.parent = parent
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            parent.text = textView.text
+            (textView as? PasteAwareTextView)?.updatePlaceholderVisibility()
+            textView.invalidateIntrinsicContentSize()
+        }
+
+        func textView(
+            _ textView: UITextView,
+            shouldChangeTextIn _: NSRange,
+            replacementText text: String
+        ) -> Bool {
+            guard text == "\n" else { return true }
+            if let pasteAwareTextView = textView as? PasteAwareTextView,
+               pasteAwareTextView.isInsertingModifiedNewline
+            {
+                return true
+            }
+            parent.onSubmit()
+            return false
+        }
+    }
+}
+
+@MainActor
+private final class PasteAwareTextView: UITextView {
+    private let placeholderLabel = UILabel()
+    private var pasteImportTail: Task<Void, Never>?
+    private var pasteImportTasks: [UUID: Task<Void, Never>] = [:]
+    private var pasteImportSessionID: UUID?
+    private var reservedImageCount = 0
+
+    var onPasteImages: (([PastedImage]) -> Void)?
+    var onPasteFailure: ((String) -> Void)?
+    var onPasteImportStateChange: ((Bool) -> Void)?
+    var remainingImageCapacity: (() -> Int)?
+    private(set) var isInsertingModifiedNewline = false
+    var placeholder = "" {
+        didSet { placeholderLabel.text = placeholder }
+    }
+
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        super.init(frame: frame, textContainer: textContainer)
+        configurePlaceholder()
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)), UIPasteboard.general.hasImages {
+            return true
+        }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        let containsShiftReturn = presses.contains { press in
+            guard let key = press.key else { return false }
+            return key.keyCode == .keyboardReturnOrEnter
+                && key.modifierFlags.contains(.shift)
+        }
+        guard containsShiftReturn else {
+            super.pressesBegan(presses, with: event)
+            return
+        }
+
+        isInsertingModifiedNewline = true
+        insertText("\n")
+        isInsertingModifiedNewline = false
+    }
+
+    override func paste(_ sender: Any?) {
+        let pasteboard = UIPasteboard.general
+        let imageProviders = Self.imageProviders(from: pasteboard)
+        guard !imageProviders.isEmpty else {
+            super.paste(sender)
+            return
+        }
+
+        if pasteboard.hasStrings {
+            super.paste(sender)
+        }
+
+        let capacity = max(
+            0,
+            (remainingImageCapacity?() ?? ChatDraftContent.maximumImageCount)
+                - reservedImageCount
+        )
+        let providers = Array(imageProviders.prefix(capacity))
+        let initiallySkippedImageCount = max(0, imageProviders.count - providers.count)
+        guard !providers.isEmpty else {
+            reportImageLimit()
+            return
+        }
+
+        let reservationCount = providers.count
+        reservedImageCount += reservationCount
+        let previousTask = pasteImportTail
+        let expectedSessionID = pasteImportSessionID
+        let importID = UUID()
+        onPasteImportStateChange?(true)
+        let importTask = Task { @MainActor [weak self] in
+            await previousTask?.value
+            guard let self else { return }
+            defer {
+                self.releaseImageReservation(
+                    reservationCount,
+                    sessionID: expectedSessionID
+                )
+                self.finishPasteImport(importID, sessionID: expectedSessionID)
+            }
+            guard !Task.isCancelled,
+                  pasteImportSessionID == expectedSessionID
+            else {
+                return
+            }
+
+            var images: [PastedImage] = []
+            for provider in providers {
+                if let image = await Self.loadImage(from: provider) {
+                    images.append(image)
+                }
+                guard !Task.isCancelled,
+                      pasteImportSessionID == expectedSessionID
+                else {
+                    return
+                }
+            }
+
+            let finalCapacity = max(
+                0,
+                remainingImageCapacity?() ?? ChatDraftContent.maximumImageCount
+            )
+            let acceptedImages = Array(images.prefix(finalCapacity))
+            guard !acceptedImages.isEmpty else {
+                if finalCapacity == 0 {
+                    reportImageLimit()
+                    return
+                }
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                DiagnosticsLogger.log(
+                    .chatView,
+                    level: .error,
+                    message: "Failed to import pasted clipboard image"
+                )
+                onPasteFailure?("The pasted image could not be attached.")
+                return
+            }
+            onPasteImages?(acceptedImages)
+
+            let skippedImageCount = initiallySkippedImageCount
+                + max(0, images.count - acceptedImages.count)
+            if skippedImageCount > 0 {
+                reportImageLimit()
+            }
+        }
+        pasteImportTasks[importID] = importTask
+        pasteImportTail = importTask
+    }
+
+    private static func imageProviders(from pasteboard: UIPasteboard) -> [NSItemProvider] {
+        pasteboard.itemProviders.filter { provider in
+            provider.registeredContentTypes.contains { $0.conforms(to: .image) }
+        }
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            invalidatePasteImports()
+        }
+    }
+
+    func updatePasteImportSession(_ sessionID: UUID) {
+        guard pasteImportSessionID != sessionID else { return }
+        invalidatePasteImports()
+        pasteImportSessionID = sessionID
+    }
+
+    func updatePlaceholderVisibility() {
+        placeholderLabel.isHidden = !text.isEmpty
+    }
+
+    private func configurePlaceholder() {
+        placeholderLabel.font = .preferredFont(forTextStyle: .body)
+        placeholderLabel.adjustsFontForContentSizeCategory = true
+        placeholderLabel.textColor = .placeholderText
+        placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
+        placeholderLabel.isUserInteractionEnabled = false
+        addSubview(placeholderLabel)
+        NSLayoutConstraint.activate([
+            placeholderLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            placeholderLabel.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            placeholderLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
+        ])
+    }
+
+    private func invalidatePasteImports() {
+        let hadActiveImports = !pasteImportTasks.isEmpty
+        for task in pasteImportTasks.values {
+            task.cancel()
+        }
+        pasteImportTasks.removeAll()
+        pasteImportTail = nil
+        reservedImageCount = 0
+        if hadActiveImports {
+            onPasteImportStateChange?(false)
+        }
+        pasteImportSessionID = nil
+    }
+
+    private func finishPasteImport(_ importID: UUID, sessionID: UUID?) {
+        guard pasteImportSessionID == sessionID else { return }
+        pasteImportTasks[importID] = nil
+        if pasteImportTasks.isEmpty {
+            pasteImportTail = nil
+            onPasteImportStateChange?(false)
+        }
+    }
+
+    private func releaseImageReservation(_ count: Int, sessionID: UUID?) {
+        guard pasteImportSessionID == sessionID else { return }
+        reservedImageCount = max(0, reservedImageCount - count)
+    }
+
+    private func reportImageLimit() {
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        onPasteFailure?(
+            "A draft can contain at most \(ChatDraftContent.maximumImageCount) images. Extra clipboard images were not attached."
+        )
+    }
+
+    private static func loadImage(from provider: NSItemProvider) async -> PastedImage? {
+        let load = ItemProviderImageLoad()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                load.start(provider: provider, continuation: continuation)
+            }
+        } onCancel: {
+            load.cancel()
+        }
+    }
+}
+
+private final class ItemProviderImageLoad: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<PastedImage?, Never>?
+    private var progress: Progress?
+    private var isFinished = false
+
+    func start(
+        provider: NSItemProvider,
+        continuation: CheckedContinuation<PastedImage?, Never>
+    ) {
+        let shouldStart = lock.withLock {
+            guard !isFinished else { return false }
+            self.continuation = continuation
+            return true
+        }
+        guard shouldStart else {
+            continuation.resume(returning: nil)
+            return
+        }
+
+        let progress = provider.loadTransferable(type: PastedImage.self) { [self] result in
+            finish(with: try? result.get())
+        }
+        let shouldCancel = lock.withLock {
+            guard !isFinished else { return true }
+            self.progress = progress
+            return false
+        }
+        if shouldCancel {
+            progress.cancel()
+        }
+    }
+
+    func cancel() {
+        let completion = lock.withLock {
+            () -> (Progress?, CheckedContinuation<PastedImage?, Never>?)? in
+            guard !isFinished else { return nil }
+            isFinished = true
+            let completion = (progress, continuation)
+            progress = nil
+            continuation = nil
+            return completion
+        }
+        guard let completion else { return }
+        completion.0?.cancel()
+        completion.1?.resume(returning: nil)
+    }
+
+    private func finish(with image: PastedImage?) {
+        let continuation = lock.withLock { () -> CheckedContinuation<PastedImage?, Never>? in
+            guard !isFinished else { return nil }
+            isFinished = true
+            progress = nil
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(returning: image)
     }
 }
 

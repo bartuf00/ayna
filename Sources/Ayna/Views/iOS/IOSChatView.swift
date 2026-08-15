@@ -71,14 +71,10 @@ struct IOSChatView: View {
                                                 viewModel.switchModelAndRetry(beforeMessage: message, newModel: newModel)
                                             } : nil,
                                             onEdit: message.role == .user && !viewModel.isGenerating ? { newContent in
-                                                let edited = conversationManager.editMessage(
-                                                    in: conversation,
-                                                    messageId: message.id,
+                                                viewModel.editMessageAndResend(
+                                                    message,
                                                     newContent: newContent
                                                 )
-                                                if edited {
-                                                    viewModel.resendAfterEdit()
-                                                }
                                             } : nil,
                                             availableModels: aiService.usableModels
                                         )
@@ -195,6 +191,9 @@ struct IOSChatView: View {
                 errorMessage: $viewModel.errorMessage,
                 attachedFiles: $viewModel.attachedFiles,
                 attachedImages: $viewModel.attachedImages,
+                pastedImages: $viewModel.pastedImages,
+                pasteImportSessionID: $viewModel.pasteImportSessionID,
+                isImportingPastedImages: $viewModel.isImportingPastedImages,
                 errorRecoverySuggestion: viewModel.errorRecoverySuggestion,
                 onRetry: viewModel.failedMessage != nil ? { viewModel.retryFailedMessage() } : nil,
                 showAttachmentButton: true,

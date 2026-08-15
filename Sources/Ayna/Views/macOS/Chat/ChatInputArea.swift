@@ -7,14 +7,17 @@
 //
 
 import AppKit
+import ImageIO
 import SwiftUI
-import UniformTypeIdentifiers
 
 /// The chat input/composer area including text editor, attachments, and model selector
 struct ChatInputArea: View {
     @Binding var messageText: String
     @Binding var isComposerFocused: Bool
     @Binding var attachedFiles: [URL]
+    @Binding var pastedImages: [PastedImage]
+    @Binding var pasteImportSessionID: UUID
+    @Binding var isImportingPastedImages: Bool
     @Binding var attachedAppContent: AppContent?
     @Binding var selectedModels: Set<String>
     @Binding var selectedModel: String
@@ -42,7 +45,7 @@ struct ChatInputArea: View {
             MCPToolSummaryView(isExpanded: $isToolSectionExpanded)
 
             // Attached files preview
-            if !attachedFiles.isEmpty {
+            if !attachedFiles.isEmpty || !pastedImages.isEmpty {
                 attachedFilesView
             }
 
@@ -79,6 +82,11 @@ struct ChatInputArea: View {
                 ForEach(attachedFiles, id: \.self) { fileURL in
                     AttachedFileRow(fileURL: fileURL) {
                         onRemoveFile(fileURL)
+                    }
+                }
+                ForEach(pastedImages) { pastedImage in
+                    PastedImageRow(pastedImage: pastedImage) {
+                        pastedImages.removeAll { $0.id == pastedImage.id }
                     }
                 }
             }
@@ -154,7 +162,16 @@ struct ChatInputArea: View {
             DynamicTextEditor(
                 text: $messageText,
                 isFirstResponder: $isComposerFocused,
-                onSubmit: onSendMessage,
+                pasteImportSessionID: $pasteImportSessionID,
+                isImportingPastedImages: $isImportingPastedImages,
+                remainingImageCapacity: { remainingImageCapacity },
+                onSubmit: {
+                    guard canSend else { return }
+                    onSendMessage()
+                },
+                onPasteImages: { images in
+                    pastedImages.append(contentsOf: images)
+                },
                 accessibilityIdentifier: textEditorIdentifier
             )
             .frame(height: textHeight)
@@ -252,12 +269,12 @@ struct ChatInputArea: View {
                 } else {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.system(size: Typography.IconSize.xl))
-                        .foregroundStyle(messageText.isEmpty ? Theme.textSecondary.opacity(0.5) : Theme.accent)
+                        .foregroundStyle(canSend ? Theme.accent : Theme.textSecondary.opacity(0.5))
                 }
             }
         }
         .buttonStyle(.plain)
-        .allowsHitTesting(isGenerating || !messageText.isEmpty)
+        .allowsHitTesting(isGenerating || canSend)
         .accessibilityIdentifier(sendButtonIdentifier)
         .padding(.horizontal, Spacing.md)
         .frame(height: textHeight + Spacing.xxl)
@@ -285,6 +302,25 @@ struct ChatInputArea: View {
 
         let calculatedHeight = ceil(boundingRect.height) + 4
         return min(max(calculatedHeight, baseHeight), maxHeight)
+    }
+
+    private var hasSendableContent: Bool {
+        ChatDraftContent.isSendable(
+            text: messageText,
+            fileURLs: attachedFiles,
+            inMemoryImageCount: pastedImages.count
+        )
+    }
+
+    private var canSend: Bool {
+        hasSendableContent && !isImportingPastedImages
+    }
+
+    private var remainingImageCapacity: Int {
+        ChatDraftContent.remainingImageCapacity(
+            fileURLs: attachedFiles,
+            inMemoryImageCount: pastedImages.count
+        )
     }
 }
 
@@ -317,7 +353,7 @@ struct AttachedFileRow: View {
     }
 
     private var isImageFile: Bool {
-        fileURL.isImageFile
+        ChatDraftContent.isImageFile(fileURL)
     }
 
     var body: some View {
@@ -390,15 +426,60 @@ struct AttachedFileRow: View {
     }
 }
 
-private extension URL {
-    var isImageFile: Bool {
-        guard !pathExtension.isEmpty,
-              let contentType = UTType(filenameExtension: pathExtension.lowercased())
-        else {
-            return false
-        }
+private struct PastedImageRow: View {
+    let pastedImage: PastedImage
+    let onRemove: () -> Void
+    @State private var thumbnail: NSImage?
 
-        return contentType.conforms(to: .image)
+    var body: some View {
+        HStack(spacing: Spacing.sm) {
+            if let thumbnail {
+                Image(nsImage: thumbnail)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 48, height: 48)
+                    .clipShape(RoundedRectangle(cornerRadius: Spacing.CornerRadius.sm))
+            } else {
+                Image(systemName: "photo")
+                    .font(.system(size: Typography.IconSize.lg))
+                    .foregroundStyle(Theme.textSecondary)
+                    .frame(width: 48, height: 48)
+            }
+
+            Text("Pasted image")
+                .font(Typography.caption)
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: Typography.IconSize.md))
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove pasted image")
+        }
+        .padding(Spacing.sm)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: Spacing.CornerRadius.md))
+        .task(id: pastedImage.id) {
+            guard thumbnail == nil else { return }
+            let data = pastedImage.data
+            let image = await Task.detached(priority: .utility) { () -> CGImage? in
+                guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+                    return nil
+                }
+                let options: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: 96,
+                    kCGImageSourceShouldCacheImmediately: true,
+                ]
+                return CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+            }.value
+            guard !Task.isCancelled, let image else { return }
+            thumbnail = NSImage(
+                cgImage: image,
+                size: NSSize(width: image.width, height: image.height)
+            )
+        }
     }
 }
 

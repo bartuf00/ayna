@@ -10,7 +10,9 @@
 
 import Combine
 import Foundation
+import ImageIO
 import os
+import UniformTypeIdentifiers
 
 // swiftlint:disable type_body_length
 // This service intentionally aggregates every provider workflow until we extract dedicated modules.
@@ -897,6 +899,185 @@ class AIService: ObservableObject {
         return .chat
     }
 
+    /// Returns a user-facing reason when a selected model cannot consume attachments.
+    func attachmentSupportError(for models: [String]) -> String? {
+        for model in models {
+            let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedModel.isEmpty else { continue }
+
+            if getModelCapability(normalizedModel) == .imageGeneration {
+                return "Image generation models do not accept attachments. Remove the attachment or choose a chat model."
+            }
+
+            let modelProvider = modelProviders[normalizedModel] ?? provider
+            if modelProvider == .appleIntelligence {
+                return "Apple Intelligence does not support attachments. Choose a vision-capable cloud model."
+            }
+        }
+        return nil
+    }
+
+    /// Returns a user-facing reason when a selected model cannot consume attachment history.
+    func attachmentHistorySupportError(for models: [String], messages: [Message]) -> String? {
+        guard messages.contains(where: { $0.attachments?.isEmpty == false }) else { return nil }
+        return attachmentSupportError(for: models)
+    }
+
+    /// Returns a user-facing reason when an Anthropic request would exceed its image limit.
+    func attachmentImageLimitError(for models: [String], messages: [Message]) -> String? {
+        guard usesAnthropicModel(models) else { return nil }
+
+        let imageCount = messages.reduce(into: 0) { count, message in
+            guard message.role == .user else { return }
+            count += message.attachments?.count(where: {
+                $0.mimeType.lowercased().hasPrefix("image/")
+            }) ?? 0
+        }
+        guard imageCount > AnthropicRequestBuilder.maxImagesPerRequest else { return nil }
+
+        return "Anthropic supports at most \(AnthropicRequestBuilder.maxImagesPerRequest) images per request. Remove some images or start a new conversation."
+    }
+
+    func attachmentImageValidationError(
+        for models: [String],
+        inMemoryAttachments attachments: [Message.FileAttachment]
+    ) async -> String? {
+        await attachmentImageValidationError(
+            for: models,
+            loading: attachments,
+            loadAttachmentData: { _ in nil }
+        )
+    }
+
+    func attachmentImageValidationError(
+        for models: [String],
+        loading attachments: [Message.FileAttachment],
+        loadAttachmentData: @Sendable (String) async -> Data?
+    ) async -> String? {
+        let appliesAnthropicPolicy = usesAnthropicModel(models)
+
+        for attachment in imageAttachments(in: attachments) {
+            guard !Task.isCancelled else { return nil }
+            let data: Data? = if let inlineData = attachment.data {
+                inlineData
+            } else if let localPath = attachment.localPath {
+                await loadAttachmentData(localPath)
+            } else {
+                nil
+            }
+            guard let data else {
+                return "Unable to load image attachment \"\(attachment.fileName)\". Remove it and try again."
+            }
+            if appliesAnthropicPolicy,
+               let validationError = AnthropicRequestBuilder.imageValidationError(data: data)
+            {
+                return "\(attachment.fileName): \(validationError)"
+            }
+
+            let validationTask = Task.detached(priority: .utility) {
+                Self.providerImageValidationError(
+                    data: data,
+                    declaredMimeType: attachment.mimeType
+                )
+            }
+            let validationError = await withTaskCancellationHandler {
+                await validationTask.value
+            } onCancel: {
+                validationTask.cancel()
+            }
+            guard !Task.isCancelled else { return nil }
+            if let validationError {
+                return "\(attachment.fileName): \(validationError)"
+            }
+        }
+        return nil
+    }
+
+    func attachmentImageValidationError(
+        for models: [String],
+        in messages: [Message],
+        loadAttachmentData: @Sendable (String) async -> Data?
+    ) async -> String? {
+        let attachments = messages.reduce(into: [Message.FileAttachment]()) { result, message in
+            guard message.role == .user else { return }
+            result.append(contentsOf: message.attachments ?? [])
+        }
+        return await attachmentImageValidationError(
+            for: models,
+            loading: attachments,
+            loadAttachmentData: loadAttachmentData
+        )
+    }
+
+    private func usesAnthropicModel(_ models: [String]) -> Bool {
+        models.contains { model in
+            let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedModel.isEmpty else { return false }
+            return (modelProviders[normalizedModel] ?? provider) == .anthropic
+        }
+    }
+
+    private func imageAttachments(
+        in attachments: [Message.FileAttachment]
+    ) -> [Message.FileAttachment] {
+        attachments.filter { $0.mimeType.lowercased().hasPrefix("image/") }
+    }
+
+    private nonisolated static func providerImageValidationError(
+        data: Data,
+        declaredMimeType: String
+    ) -> String? {
+        guard !Task.isCancelled,
+              !data.isEmpty,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0
+        else {
+            return "Image data is invalid or corrupted."
+        }
+
+        let decodedContentType = CGImageSourceGetType(source)
+            .flatMap { UTType($0 as String) }
+        guard let decodedContentType,
+              let decodedFormat = providerImageFormat(for: decodedContentType),
+              let declaredContentType = UTType(mimeType: declaredMimeType),
+              let declaredFormat = providerImageFormat(for: declaredContentType)
+        else {
+            return "Unsupported image format. Supported: JPEG, PNG, GIF, WebP"
+        }
+        guard decodedFormat == declaredFormat else {
+            return "Image data does not match the declared \(declaredMimeType) format."
+        }
+
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 64,
+            kCGImageSourceShouldCacheImmediately: true,
+        ]
+        guard !Task.isCancelled,
+              CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) != nil
+        else {
+            return Task.isCancelled ? nil : "Image data is invalid or corrupted."
+        }
+        return nil
+    }
+
+    private nonisolated static func providerImageFormat(for contentType: UTType) -> String? {
+        if contentType.conforms(to: .jpeg) {
+            return "jpeg"
+        }
+        if contentType.conforms(to: .png) {
+            return "png"
+        }
+        if contentType.conforms(to: .gif) {
+            return "gif"
+        }
+        if contentType.conforms(to: .webP) {
+            return "webp"
+        }
+        return nil
+    }
+
     fileprivate func cancelTextRequest(_ flightID: RequestFlightID) {
         let dataTask = currentTask.take(ifOwnedBy: flightID)
         let backgroundDataTask = backgroundDataTasks.removeValue(forKey: flightID)
@@ -1402,6 +1583,22 @@ class AIService: ObservableObject {
                 "isAzure": "\(usesAzureEndpoint)"
             ]
         )
+
+        if effectiveProvider == .appleIntelligence,
+           messages.contains(where: { $0.attachments?.isEmpty == false })
+        {
+            let error = AIError.apiError(
+                "Apple Intelligence does not support attachments. Choose a vision-capable cloud model."
+            )
+            DiagnosticsLogger.log(
+                .aiService,
+                level: .error,
+                message: "Apple Intelligence request rejected because it contains attachments",
+                metadata: ["model": requestModel]
+            )
+            onError(error)
+            return requestHandle
+        }
 
         // Handle Apple Intelligence separately
         #if !os(watchOS)

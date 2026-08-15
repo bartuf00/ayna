@@ -1,3 +1,4 @@
+// swiftlint:disable file_length
 #if os(macOS)
 //
 //  MacNewChatView.swift
@@ -11,12 +12,53 @@ import SwiftUI
 
 // swiftlint:disable:next type_body_length
 struct MacNewChatView: View {
+    private struct SendPreparation {
+        let text: String
+        let files: [URL]
+        let pastedImages: [PastedImage]
+        let appContent: AppContent?
+        let selectedModels: Set<String>
+        let activeModel: String?
+        let prebuiltUserMessage: Message?
+        let consumesComposer: Bool
+
+        init(
+            text: String,
+            files: [URL],
+            pastedImages: [PastedImage],
+            appContent: AppContent?,
+            selectedModels: Set<String>,
+            activeModel: String?,
+            prebuiltUserMessage: Message? = nil,
+            consumesComposer: Bool = true
+        ) {
+            self.text = text
+            self.files = files
+            self.pastedImages = pastedImages
+            self.appContent = appContent
+            self.selectedModels = selectedModels
+            self.activeModel = activeModel
+            self.prebuiltUserMessage = prebuiltUserMessage
+            self.consumesComposer = consumesComposer
+        }
+    }
+
+    private struct FailedSendPayload {
+        let text: String
+        let userMessage: Message
+        let selectedModels: Set<String>
+        let activeModel: String
+    }
+
     @EnvironmentObject var conversationManager: ConversationManager
     @ObservedObject var aiService = AIService.shared
     @Binding var selectedConversationId: UUID?
     @State private var messageText = ""
     @State private var isComposerFocused = true
     @State private var attachedFiles: [URL] = []
+    @State private var pastedImages: [PastedImage] = []
+    @State private var pasteImportSessionID = UUID()
+    @State private var isImportingPastedImages = false
     @State var isGenerating = false
     @State var currentConversationId: UUID?
     @State private var selectedModel = AIService.shared.selectedModel
@@ -37,6 +79,7 @@ struct MacNewChatView: View {
     @State var errorMessage: String?
     @State var errorRecoverySuggestion: String?
     @State var shouldOfferOpenSettings = false
+    @State private var failedSendPayload: FailedSendPayload?
 
     // App content attachment (Attach from App)
     @State private var showAppContentPicker = false
@@ -135,14 +178,11 @@ struct MacNewChatView: View {
                                             onEdit: message.role == .user && currentConversation != nil
                                                 ? { newContent in
                                                     if let conversation = currentConversation {
-                                                        let edited = conversationManager.editMessage(
-                                                            in: conversation,
-                                                            messageId: message.id,
-                                                            newContent: newContent
-                                                    )
-                                                        if edited {
-                                                            sendMessageForConversation(conversation, model: conversation.model)
-                                                        }
+                                                        editMessageAndResend(
+                                                            message,
+                                                            newContent: newContent,
+                                                            in: conversation
+                                                        )
                                                     }
                                                 } : nil
                                         )
@@ -201,6 +241,7 @@ struct MacNewChatView: View {
                         ErrorBannerView(
                             message: errorMessage,
                             recoverySuggestion: errorRecoverySuggestion,
+                            onRetry: failedSendPayload == nil ? nil : { retryFailedMessage() },
                             openSettingsTab: shouldOfferOpenSettings ? SettingsTab.models : nil,
                             onDismiss: { dismissError() },
                             identifierPrefix: "newchat.error"
@@ -248,6 +289,9 @@ struct MacNewChatView: View {
             messageText: $messageText,
             isComposerFocused: $isComposerFocused,
             attachedFiles: $attachedFiles,
+            pastedImages: $pastedImages,
+            pasteImportSessionID: $pasteImportSessionID,
+            isImportingPastedImages: $isImportingPastedImages,
             attachedAppContent: $attachedAppContent,
             selectedModels: $selectedModels,
             selectedModel: $selectedModel,
@@ -410,20 +454,53 @@ struct MacNewChatView: View {
             isComposerFocused = true
             return
         }
-
-        guard !messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard !isImportingPastedImages, ChatDraftContent.isSendable(text: messageText, fileURLs: attachedFiles, inMemoryImageCount: pastedImages.count) else {
             isComposerFocused = true
             return
         }
+            let preparation = SendPreparation(
+                text: messageText,
+                files: attachedFiles,
+                pastedImages: pastedImages,
+                appContent: attachedAppContent,
+                selectedModels: selectedModels,
+                activeModel: resolveModelForSending()
+            )
+            pasteImportSessionID = UUID()
+            scheduleSend(preparation)
+        }
 
+        private func scheduleSend(_ preparation: SendPreparation) {
             let preparationID = UUID()
             sendPreparationID = preparationID
             isGenerating = true
             let task = Task { @MainActor in
                 guard !Task.isCancelled, sendPreparationID == preparationID else { return }
-                await sendMessage(preparationID: preparationID)
+                await sendMessage(preparationID: preparationID, preparation: preparation)
             }
             sendPreparationTask = task
+        }
+
+        private func retryFailedMessage() {
+            guard !isGenerating, sendPreparationTask == nil,
+                  let payload = failedSendPayload
+            else {
+                return
+            }
+
+            errorMessage = nil
+            errorRecoverySuggestion = nil
+            shouldOfferOpenSettings = false
+            scheduleSend(SendPreparation(
+                text: payload.text,
+                files: [],
+                pastedImages: [],
+                appContent: nil,
+                selectedModels: payload.selectedModels,
+                activeModel: payload.activeModel,
+                prebuiltUserMessage: payload.userMessage,
+                consumesComposer: false
+            ))
         }
 
         func cancelSendPreparation() {
@@ -432,9 +509,127 @@ struct MacNewChatView: View {
             sendPreparationID = nil
         }
 
-        private func sendMessage(preparationID: UUID) async {
+        private func discardStoredAttachments(in message: Message) {
+            for attachment in message.attachments ?? [] {
+                if let localPath = attachment.localPath {
+                    AttachmentStorage.shared.delete(path: localPath)
+                }
+            }
+        }
+
+        private func commitUserMessageIfNeeded(
+            _ userMessage: Message,
+            to conversation: Conversation,
+            consuming preparation: SendPreparation
+        ) -> Bool {
+            let reusesCommittedUserMessage = conversation.messages.contains { $0.id == userMessage.id }
+            if !reusesCommittedUserMessage {
+                conversationManager.addMessage(to: conversation, message: userMessage)
+                guard conversationManager.conversation(byId: conversation.id)?.messages.contains(where: {
+                    $0.id == userMessage.id
+                }) == true else {
+                    errorMessage = "Unable to save this message. Try again."
+                    return false
+                }
+
+                if let memoryResponse = MemoryContextProvider.shared.processMemoryCommand(in: userMessage.content) {
+                    logNewChat("💾 Memory command processed: \(memoryResponse)", level: .info)
+                }
+            }
+
+            if preparation.consumesComposer {
+                if messageText == preparation.text {
+                    messageText = ""
+                }
+                attachedFiles.removeAll { preparation.files.contains($0) }
+                let pastedImageIDs = Set(preparation.pastedImages.map(\.id))
+                pastedImages.removeAll { pastedImageIDs.contains($0.id) }
+                if AppContent.hasSamePayload(attachedAppContent, preparation.appContent) {
+                    attachedAppContent = nil
+                }
+            }
+            isComposerFocused = true
+            return true
+        }
+
+        private func resolveConversation(
+            activeModel: String,
+            selectedModels: Set<String>
+        ) -> Conversation? {
+            let conversation: Conversation
+            if let existingId = currentConversationId,
+               let existingConversation = conversationManager.conversation(byId: existingId)
+            {
+                conversation = existingConversation
+                logNewChat(
+                    "📝 Continuing with existing conversation: \(existingId)",
+                    metadata: ["conversationId": existingId.uuidString]
+                )
+            } else {
+                conversationManager.createNewConversation()
+                guard let newConversation = conversationManager.conversations.first else { return nil }
+                conversation = newConversation
+                currentConversationId = newConversation.id
+                logNewChat(
+                    "🆕 Created new conversation: \(newConversation.id)",
+                    level: .info,
+                    metadata: ["conversationId": newConversation.id.uuidString]
+                )
+            }
+
+            conversationManager.updateModel(for: conversation, model: activeModel)
+            var updatedConversation = conversation
+            updatedConversation.activeModels = Array(selectedModels)
+            updatedConversation.multiModelEnabled = selectedModels.count > 1
+            conversationManager.updateConversation(updatedConversation)
+            return conversation
+        }
+
+        private func validateAttachments(
+            for userMessage: Message,
+            conversationId: UUID?,
+            models: [String]
+        ) async -> Bool {
+            let existingMessages: [Message]
+            if let conversationId {
+                guard let loadedConversation = await ConversationSendPreflight.loadConversationHistory(
+                    conversationId: conversationId,
+                    manager: conversationManager
+                ) else {
+                    errorMessage = "Unable to load this conversation's history. Try again."
+                    return false
+                }
+                existingMessages = loadedConversation.messages
+            } else {
+                existingMessages = []
+            }
+
+            let proposedMessages = ChatDraftContent.messagesByIncludingUserMessageIfNeeded(
+                userMessage,
+                in: existingMessages
+            )
+            if let failure = await ConversationSendPreflight.attachmentFailure(
+                models: models,
+                messages: proposedMessages,
+                aiService: aiService,
+                loadAttachmentData: { path in
+                    await AttachmentStorage.shared.loadData(path: path)
+                }
+            ) {
+                errorMessage = failure.message
+                errorRecoverySuggestion = failure.recoverySuggestion
+                return false
+            }
+            return true
+        }
+
+        private func sendMessage(preparationID: UUID, preparation: SendPreparation) async {
             var handedOff = false
+            var uncommittedUserMessage: Message?
             defer {
+                if let uncommittedUserMessage {
+                    discardStoredAttachments(in: uncommittedUserMessage)
+                }
                 if sendPreparationID == preparationID {
                     sendPreparationTask = nil
                     sendPreparationID = nil
@@ -447,66 +642,69 @@ struct MacNewChatView: View {
             dismissError()
             guard sendPreparationID == preparationID, !Task.isCancelled else { return }
 
-        guard let activeModel = resolveModelForSending() else {
+        guard let activeModel = preparation.activeModel else {
             logNewChat("⚠️ Cannot send message: no model selected", level: .error)
             errorMessage = "Select a model in Settings → Models"
             errorRecoverySuggestion = "Add or select a model before sending your first message"
             shouldOfferOpenSettings = true
             return
         }
-
+        let textToSend = preparation.text
+        let filesToSend = preparation.files
+            let pastedImagesToSend = preparation.pastedImages
+            let appContentToSend = preparation.appContent
+            let selectedModelsToSend = preparation.selectedModels
+            if !filesToSend.isEmpty || !pastedImagesToSend.isEmpty
+                || preparation.prebuiltUserMessage?.attachments?.isEmpty == false
+            {
+                let attachmentModels = selectedModelsToSend.isEmpty ? [activeModel] : Array(selectedModelsToSend)
+                if let supportError = aiService.attachmentSupportError(for: attachmentModels) {
+                    errorMessage = supportError
+                    return
+                }
+            }
         aiService.selectedModel = activeModel
         ensureConversationModelMatchesSelection(activeModel)
 
-        let textToSend = messageText
-        let filesToSend = attachedFiles
-            let appContentToSend = attachedAppContent
-
             // Attachment construction is the only suspension in send preparation. Do it before
             // mutating conversation state, then recheck lifecycle ownership before committing.
-            let userMessage = await ChatMessageBuilder.createUserMessage(
-                text: textToSend,
-                appContent: appContentToSend,
-                fileURLs: filesToSend,
-                saveToStorage: false
-            )
+            let userMessage: Message
+            if let prebuiltUserMessage = preparation.prebuiltUserMessage {
+                userMessage = prebuiltUserMessage
+            } else {
+                userMessage = await ChatMessageBuilder.createUserMessage(
+                    text: textToSend,
+                    appContent: appContentToSend,
+                    fileURLs: filesToSend,
+                    pastedImages: pastedImagesToSend,
+                    saveToStorage: true
+                )
+                uncommittedUserMessage = userMessage
+            }
             guard sendPreparationID == preparationID, !Task.isCancelled else { return }
-
-        // Get or create the conversation
-        let conversation: Conversation
-        if let existingId = currentConversationId,
-           let existingConversation = conversationManager.conversations.first(where: {
-               $0.id == existingId
-           })
-        {
-            // Continue with existing conversation
-            conversation = existingConversation
-            logNewChat(
-                "📝 Continuing with existing conversation: \(existingId)",
-                metadata: ["conversationId": existingId.uuidString]
-            )
-        } else {
-            // Create a new conversation
-            conversationManager.createNewConversation()
-            guard let newConversation = conversationManager.conversations.first else {
+            guard ChatDraftContent.isSendable(
+                text: userMessage.content,
+                attachments: userMessage.attachments ?? []
+            ) else {
+                errorMessage = "Unable to load a supported image attachment."
+                errorRecoverySuggestion = "Choose a JPEG, PNG, GIF, or WebP image and try again."
                 return
             }
-            conversation = newConversation
-            currentConversationId = newConversation.id
-            logNewChat(
-                "🆕 Created new conversation: \(newConversation.id)",
-                level: .info,
-                metadata: ["conversationId": newConversation.id.uuidString]
-            )
-        }
 
-        conversationManager.updateModel(for: conversation, model: activeModel)
+            let requestModels = selectedModelsToSend.isEmpty
+                ? [activeModel]
+                : Array(selectedModelsToSend)
+            guard await validateAttachments(
+                for: userMessage,
+                conversationId: currentConversationId,
+                models: requestModels
+            ) else { return }
+            guard sendPreparationID == preparationID, !Task.isCancelled else { return }
 
-        // Update conversation with multi-model settings
-        var updatedConversation = conversation
-        updatedConversation.activeModels = Array(selectedModels)
-        updatedConversation.multiModelEnabled = selectedModels.count > 1
-        conversationManager.updateConversation(updatedConversation)
+            guard let conversation = resolveConversation(
+                activeModel: activeModel,
+                selectedModels: selectedModelsToSend
+            ) else { return }
 
             if appContentToSend != nil {
             logNewChat(
@@ -520,18 +718,18 @@ struct MacNewChatView: View {
             )
         }
 
-        conversationManager.addMessage(to: conversation, message: userMessage)
-
-        // Process memory commands (e.g., "remember that I prefer dark mode")
-        if let memoryResponse = MemoryContextProvider.shared.processMemoryCommand(in: userMessage.content) {
-            logNewChat("💾 Memory command processed: \(memoryResponse)", level: .info)
-        }
-
-        // Clear input first
-        messageText = ""
-        isComposerFocused = true
-        attachedFiles.removeAll()
-        attachedAppContent = nil // Clear app content after sending
+            guard commitUserMessageIfNeeded(
+                userMessage,
+                to: conversation,
+                consuming: preparation
+            ) else { return }
+            uncommittedUserMessage = nil
+            failedSendPayload = FailedSendPayload(
+                text: textToSend,
+                userMessage: userMessage,
+                selectedModels: selectedModelsToSend,
+                activeModel: activeModel
+            )
 
         // DON'T switch views yet - stay in NewChatView so the stop button remains visible
         // The view switch will happen in the completion handler after generation finishes
@@ -541,8 +739,8 @@ struct MacNewChatView: View {
         if modelCapability == .imageGeneration {
                 handedOff = true
             // Image generation flow - handle multi-model image gen
-            if selectedModels.count > 1 {
-                generateMultiModelImages(prompt: textToSend, models: Array(selectedModels), conversation: conversation)
+            if selectedModelsToSend.count > 1 {
+                generateMultiModelImages(prompt: textToSend, models: Array(selectedModelsToSend), conversation: conversation)
             } else {
                 generateImage(prompt: textToSend, model: activeModel, conversation: conversation)
             }
@@ -550,11 +748,11 @@ struct MacNewChatView: View {
         }
 
         // Send the message immediately (no delay needed)
-        if selectedModels.count > 1 {
+        if selectedModelsToSend.count > 1 {
                 handedOff = true
             sendMultiModelMessage(
                 userMessageId: userMessage.id,
-                models: Array(selectedModels),
+                models: Array(selectedModelsToSend),
                 temperature: conversation.temperature
             )
         } else {
@@ -603,6 +801,105 @@ struct MacNewChatView: View {
                 tools: tools,
                 assistantMessageID: assistantMessage.id
         )
+    }
+
+    private func editMessageAndResend(
+        _ message: Message,
+        newContent: String,
+        in conversation: Conversation
+    ) {
+        guard !isGenerating, sendPreparationTask == nil else { return }
+        guard let proposedHistory = ChatDraftContent.effectiveHistory(
+            byEditingUserMessage: message.id,
+            newContent: newContent,
+            in: conversation
+        ) else {
+            return
+        }
+
+        let resendModel = conversation.model
+        let conversationID = conversation.id
+        let performEdit: @MainActor @Sendable () -> Void = {
+            performEditMessageAndResend(
+                messageID: message.id,
+                newContent: newContent,
+                model: resendModel,
+                conversationID: conversationID
+            )
+        }
+        preflightHistoryMutation(
+            models: [resendModel],
+            messages: proposedHistory,
+            onSuccess: performEdit
+        )
+    }
+
+    private func preflightHistoryMutation(
+        models: [String],
+        messages: [Message],
+        onSuccess: @escaping @MainActor @Sendable () -> Void
+    ) {
+        if let failure = ConversationSendPreflight.attachmentRuleFailure(
+            models: models,
+            messages: messages,
+            aiService: aiService
+        ) {
+            errorMessage = failure.message
+            errorRecoverySuggestion = failure.recoverySuggestion
+            return
+        }
+
+        guard ConversationSendPreflight.hasImageAttachments(in: messages) else {
+            onSuccess()
+            return
+        }
+
+        let preparationID = UUID()
+        sendPreparationID = preparationID
+        isGenerating = true
+        let task = Task { @MainActor in
+            let failure = await ConversationSendPreflight.attachmentDataFailure(
+                models: models,
+                messages: messages,
+                aiService: aiService,
+                loadAttachmentData: { path in
+                    await AttachmentStorage.shared.loadData(path: path)
+                }
+            )
+            guard !Task.isCancelled, sendPreparationID == preparationID else { return }
+
+            sendPreparationTask = nil
+            sendPreparationID = nil
+            isGenerating = false
+            if let failure {
+                errorMessage = failure.message
+                errorRecoverySuggestion = failure.recoverySuggestion
+                return
+            }
+            onSuccess()
+        }
+        sendPreparationTask = task
+    }
+
+    private func performEditMessageAndResend(
+        messageID: UUID,
+        newContent: String,
+        model: String,
+        conversationID: UUID
+    ) {
+        guard !isGenerating, sendPreparationTask == nil,
+              let conversation = conversationManager.conversation(byId: conversationID),
+              conversation.model == model,
+              conversationManager.editMessage(
+                  in: conversation,
+                  messageId: messageID,
+                  newContent: newContent
+              ),
+              let updatedConversation = conversationManager.conversation(byId: conversationID)
+        else {
+            return
+        }
+        sendMessageForConversation(updatedConversation, model: updatedConversation.model)
     }
 
     // MARK: - Image Generation
@@ -656,6 +953,7 @@ struct MacNewChatView: View {
 
                 guard coordinator.finishOperation(operationID) else { return }
                 isGenerating = false
+                failedSendPayload = nil
                 selectedConversationId = conversation.id
             }
         }
@@ -704,12 +1002,14 @@ struct MacNewChatView: View {
         let responseGroupId = responsePlan.responseGroupId
         let messageIds = responsePlan.messageIDsByModel
 
-        for placeholderMessage in responsePlan.placeholderMessages {
-            conversationManager.addMessage(to: conversation, message: placeholderMessage)
-        }
-
-        if let index = conversationManager.conversations.firstIndex(where: { $0.id == conversation.id }) {
-            conversationManager.conversations[index].responseGroups.append(responsePlan.responseGroup)
+        guard conversationManager.beginMultiModelResponse(
+            to: conversation,
+            messages: responsePlan.placeholderMessages,
+            responseGroup: responsePlan.responseGroup
+        ) != nil else {
+            _ = coordinator.finishOperation(operationID)
+            isGenerating = false
+            return
         }
 
         registerNewChatImageBatchCancellation(
@@ -854,8 +1154,16 @@ struct MacNewChatView: View {
         guard counter.isComplete, coordinator.finishOperation(operationID) else { return }
         if let conversation = conversationManager.conversation(byId: conversationID) {
             conversationManager.save(conversation)
+            if let group = conversation.responseGroups.last,
+               group.responses.allSatisfy({ $0.status == .failed })
+            {
+                isGenerating = false
+                errorMessage = errorMessage ?? "All models failed"
+                return
+            }
         }
         isGenerating = false
+        failedSendPayload = nil
         selectedConversationId = conversationID
     }
 
@@ -870,11 +1178,8 @@ struct MacNewChatView: View {
             metadata: ["models": models.joined(separator: ", ")]
         )
 
-        // Get updated conversation
         guard let conversationId = currentConversationId,
-              let updatedConversation = conversationManager.conversations.first(where: {
-                  $0.id == conversationId
-              })
+              let conversation = conversationManager.conversation(byId: conversationId)
         else {
             isGenerating = false
             return
@@ -882,20 +1187,21 @@ struct MacNewChatView: View {
 
         let responsePlan = MultiModelResponsePlan(models: models, userMessageId: userMessageId)
         let responseGroupId = responsePlan.responseGroupId
-        for placeholderMessage in responsePlan.placeholderMessages {
-            conversationManager.addMessage(to: updatedConversation, message: placeholderMessage)
+        guard let updatedConversation = conversationManager.beginMultiModelResponse(
+            to: conversation,
+            messages: responsePlan.placeholderMessages,
+            responseGroup: responsePlan.responseGroup
+        ) else {
+            isGenerating = false
+            return
         }
-
-        // Add response group to conversation
-        conversationManager.addResponseGroup(to: updatedConversation, group: responsePlan.responseGroup)
 
         let messageIdsByModel = responsePlan.messageIDsByModel
 
         // Prepare messages for API
         var messagesToSend = updatedConversation.getEffectiveHistory()
         if let systemPrompt = conversationManager.effectiveSystemPrompt(for: updatedConversation) {
-            let systemMessage = Message(role: .system, content: systemPrompt)
-            messagesToSend.insert(systemMessage, at: 0)
+            messagesToSend.insert(Message(role: .system, content: systemPrompt), at: 0)
         }
 
             // Send to all models in parallel under this view's owner-specific operation.
@@ -953,6 +1259,15 @@ struct MacNewChatView: View {
                     }
                         activeMultiModelResponseGroupID = nil
                         guard coordinator.finishOperation(operationID) else { return }
+
+                        if let conversation = conversationManager.conversation(byId: conversationId),
+                           let group = conversation.getResponseGroup(responseGroupId),
+                           group.responses.allSatisfy({ $0.status == .failed })
+                        {
+                            errorMessage = errorMessage ?? "All models failed"
+                            return
+                        }
+                        failedSendPayload = nil
 
                     // Switch to chat view
                     selectedConversationId = conversationId
@@ -1280,6 +1595,7 @@ struct MacNewChatView: View {
                     currentToolName = nil
                 toolCallDepth = 0
                     isGenerating = false
+                failedSendPayload = nil
                     logNewChat(
                     "✅ Initial message finished streaming, switching to ChatView",
                         level: .info,
@@ -1359,6 +1675,7 @@ struct MacNewChatView: View {
     }
 
     private func dismissError() {
+        failedSendPayload = nil
         errorMessage = nil
         errorRecoverySuggestion = nil
         shouldOfferOpenSettings = false

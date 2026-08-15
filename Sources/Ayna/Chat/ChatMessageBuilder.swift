@@ -49,6 +49,7 @@
         /// - Returns: Array of file attachments
         static func buildAttachments(
             from fileURLs: [URL],
+            pastedImages: [PastedImage] = [],
             saveToStorage: Bool = false,
             attachmentStorage: AttachmentStorage = .shared,
             fileDataLoader: @escaping @Sendable (URL) async -> Data? = { fileURL in
@@ -73,7 +74,7 @@
 
                 if saveToStorage {
                     let pathExtension = fileURL.pathExtension
-                    localPath = try? attachmentStorage.save(
+                    localPath = try? await attachmentStorage.saveData(
                         data: fileData,
                         extension: pathExtension,
                         generation: attachmentGeneration
@@ -87,6 +88,24 @@
                     localPath: localPath
                 )
                 attachments.append(attachment)
+            }
+
+            for pastedImage in pastedImages {
+                var localPath: String?
+                if saveToStorage {
+                    localPath = try? await attachmentStorage.saveData(
+                        data: pastedImage.data,
+                        extension: pastedImage.fileExtension,
+                        generation: attachmentGeneration
+                    )
+                }
+
+                attachments.append(Message.FileAttachment(
+                    fileName: pastedImage.fileName,
+                    mimeType: pastedImage.mimeType,
+                    data: localPath == nil ? pastedImage.data : nil,
+                    localPath: localPath
+                ))
             }
 
             return attachments
@@ -105,10 +124,17 @@
             text: String,
             appContent: AppContent?,
             fileURLs: [URL],
-            saveToStorage: Bool = false
+            pastedImages: [PastedImage] = [],
+            saveToStorage: Bool = false,
+            attachmentStorage: AttachmentStorage = .shared
         ) async -> Message {
             let content = formatContent(text: text, appContent: appContent)
-            let attachments = await buildAttachments(from: fileURLs, saveToStorage: saveToStorage)
+            let attachments = await buildAttachments(
+                from: fileURLs,
+                pastedImages: pastedImages,
+                saveToStorage: saveToStorage,
+                attachmentStorage: attachmentStorage
+            )
 
             return Message(
                 role: .user,
