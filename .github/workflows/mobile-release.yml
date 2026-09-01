@@ -78,7 +78,7 @@ jobs:
         xcodebuild \
           -project AynaMobile.xcodeproj \
           -scheme "${{ matrix.scheme }}" \
-          -destination "generic/platform=${{ matrix.name }}" \
+          -destination "generic/platform=${{ matrix.name }},sdk=${{ matrix.sdk }}" \
           -configuration Release \
           -archivePath "$ARCHIVE_PATH" \
           CODE_SIGN_STYLE=Automatic \
