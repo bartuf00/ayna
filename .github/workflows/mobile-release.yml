@@ -168,7 +168,7 @@ jobs:
         echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
     - name: Download build artifacts
-      uses: actions/download-artifact@018d4f0fd2272a8a3b8ad3d1ba93867c8bd3b7d7 # v4
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       with:
         pattern: ayna-*
         merge-multiple: true
