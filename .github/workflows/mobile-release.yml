@@ -32,14 +32,14 @@ jobs:
             sdk: iphoneos
             app_name: Ayna.app
             artifact_prefix: ayna-ios
-            sim_destination: 'platform=iOS Simulator,name=iPhone 17'
+            sim_destination: 'platform=iOS Simulator,OS=26.2,name=iPhone 17'
             empty_sim_zip: ''
           - name: watchOS
             scheme: Ayna-watchOS
             sdk: watchos
             app_name: Ayna Watch App.app
             artifact_prefix: ayna-watchos
-            sim_destination: 'platform=watchOS Simulator,name=Apple Watch Series 11 (46mm)'
+            sim_destination: 'platform=watchOS Simulator,OS=26.2,name=Apple Watch Series 11 (46mm)'
             empty_sim_zip: '1' # unsigned .app has no embedded binary; skip simulator zip
 
     steps:
@@ -47,7 +47,8 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
     - name: Select Xcode version
-      run: sudo xcode-select -s /Applications/Xcode_26.0.app/Contents/Developer
+      # Xcode 26.2 matches the runner's installed iOS/watchOS 26.2 simulator runtimes.
+      run: sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
 
     - name: Show Swift version
       run: swift --version
