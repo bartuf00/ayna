@@ -1,0 +1,258 @@
+name: iOS & watchOS Release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional tag/label used for naming the release (e.g. v1.1)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: iOS
+            scheme: Ayna-iOS
+            sdk: iphoneos
+            app_name: Ayna.app
+            artifact_prefix: ayna-ios
+            sim_destination: 'platform=iOS Simulator,name=iPhone 17'
+            empty_sim_zip: ''
+          - name: watchOS
+            scheme: Ayna-watchOS
+            sdk: watchos
+            app_name: Ayna Watch App.app
+            artifact_prefix: ayna-watchos
+            sim_destination: 'platform=watchOS Simulator,name=Apple Watch Series 11 (46mm)'
+            empty_sim_zip: '1' # unsigned .app has no embedded binary; skip simulator zip
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+
+    - name: Select Xcode version
+      run: sudo xcode-select -s /Applications/Xcode_26.0.app/Contents/Developer
+
+    - name: Show Swift version
+      run: swift --version
+
+    - name: Clear SPM artifacts cache
+      run: rm -rf ~/Library/Caches/org.swift.swiftpm/artifacts
+
+    - name: Determine version and tag
+      id: version
+      run: |
+        if [ -n "${{ inputs.tag }}" ]; then
+          TAG="${{ inputs.tag }}"
+        elif [ "${{ github.ref_type }}" = "tag" ]; then
+          TAG="${{ github.ref_name }}"
+        else
+          TAG="v0.0.0-mobile.${{ github.run_number }}"
+        fi
+        VERSION="${TAG#v}" # strip 'v' prefix
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "Using tag: $TAG / version: $VERSION"
+
+    - name: Build unsigned archive
+      run: |
+        set -o pipefail
+        ARCHIVE_PATH=".build/${{ matrix.artifact_prefix }}.xcarchive"
+
+        xcodebuild \
+          -project AynaMobile.xcodeproj \
+          -scheme "${{ matrix.scheme }}" \
+          -destination "generic/platform=${{ matrix.name }}" \
+          -configuration Release \
+          -archivePath "$ARCHIVE_PATH" \
+          CODE_SIGN_STYLE=Automatic \
+          DEVELOPMENT_TEAM= \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          MARKETING_VERSION="${{ steps.version.outputs.version }}" \
+          CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+          archive
+
+    - name: Verify archive version
+      run: |
+        PLIST_VERSION=$(/usr/libexec/PlistBuddy -c "Print :ApplicationProperties:CFBundleShortVersionString" ".build/${{ matrix.artifact_prefix }}.xcarchive/Info.plist")
+        EXPECTED_VERSION="${{ steps.version.outputs.version }}"
+        echo "Archive version: $PLIST_VERSION (expected: $EXPECTED_VERSION)"
+        if [ "$PLIST_VERSION" != "$EXPECTED_VERSION" ]; then
+          echo "Error: Version mismatch!"
+          exit 1
+        fi
+
+    - name: Package archive
+      run: |
+        cd .build
+        zip -qry "../${{ matrix.artifact_prefix }}-${{ steps.version.outputs.tag }}.xcarchive.zip" "${{ matrix.artifact_prefix }}.xcarchive"
+        cd ..
+
+    - name: Build simulator app
+      if: ${{ !matrix.empty_sim_zip }}
+      run: |
+        set -o pipefail
+        DERIVED_DATA=".build/sim-${{ matrix.artifact_prefix }}"
+
+        xcodebuild \
+          -project AynaMobile.xcodeproj \
+          -scheme "${{ matrix.scheme }}" \
+          -destination "${{ matrix.sim_destination }}" \
+          -configuration Debug \
+          -derivedDataPath "$DERIVED_DATA" \
+          CODE_SIGNING_ALLOWED=NO \
+          build
+
+        APP_PATH=$(find "$DERIVED_DATA/Build/Products" -maxdepth 2 -type d -name "${{ matrix.app_name }}" | head -n 1)
+        if [ -z "$APP_PATH" ]; then
+          echo "Error: Could not find ${{ matrix.app_name }} in derived data"
+          exit 1
+        fi
+        echo "SIM_APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+    - name: Package simulator app
+      if: ${{ !matrix.empty_sim_zip }}
+      run: |
+        cd "$(dirname "$SIM_APP_PATH")"
+        zip -qry "$OLDPWD/${{ matrix.artifact_prefix }}-${{ steps.version.outputs.tag }}-simulator.zip" "${{ matrix.app_name }}"
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+      with:
+        name: ${{ matrix.artifact_prefix }}-${{ steps.version.outputs.tag }}
+        path: |
+          ${{ matrix.artifact_prefix }}-${{ steps.version.outputs.tag }}*.zip
+        retention-days: 30
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 15
+
+    steps:
+    - name: Checkout code (for changelog)
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+      with:
+        fetch-depth: 0
+
+    - name: Determine version and tag
+      id: version
+      run: |
+        if [ -n "${{ inputs.tag }}" ]; then
+          TAG="${{ inputs.tag }}"
+        elif [ "${{ github.ref_type }}" = "tag" ]; then
+          TAG="${{ github.ref_name }}"
+        else
+          TAG="v0.0.0-mobile.${{ github.run_number }}"
+        fi
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@018d4f0fd2272a8a3b8ad3d1ba93867c8bd3b7d7 # v4
+      with:
+        pattern: ayna-*
+        merge-multiple: true
+
+    - name: Generate checksums and release notes
+      run: |
+        shasum -a 256 *.zip > checksums.txt
+
+        TAG="${{ steps.version.outputs.tag }}"
+        PREV_TAG=$(git tag -l 'v*' --sort=-v:refname | grep -A1 "^${TAG}$" | tail -1)
+        if [ "$PREV_TAG" = "$TAG" ] || [ -z "$PREV_TAG" ]; then
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+        fi
+
+        if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$TAG" ]; then
+          CHANGELOG=$(git log --pretty=format:"- %s" "$PREV_TAG".."$TAG" --no-merges | head -50)
+        else
+          CHANGELOG="- iOS & watchOS build"
+        fi
+
+        cat > release_notes.md << EOF
+        ## What's New
+
+        ${CHANGELOG}
+
+        ## Artifacts (iOS & watchOS — unsigned)
+
+        | File | Contents |
+        | --- | --- |
+        | \`ayna-ios-${TAG}.xcarchive.zip\` | Unsigned iOS release archive |
+        | \`ayna-watchos-${TAG}.xcarchive.zip\` | Unsigned watchOS release archive |
+        | \`ayna-ios-${TAG}-simulator.zip\` | iOS Simulator build (\`Ayna.app\`) |
+        | \`checksums.txt\` | SHA-256 checksums |
+
+        ## Installation
+
+        ### iOS / watchOS device builds
+        The archives are built **unsigned** (no Apple Developer credentials in CI). To run on a device:
+        1. Unzip the \`.xcarchive.zip\`
+        2. Open the archive in Xcode (Window → Organizer) or re-sign it with your own certificate
+        3. Export/Distribute with your provisioning profile
+
+        ### iOS Simulator build
+        1. Unzip \`ayna-ios-${TAG}-simulator.zip\`
+        2. Boot a simulator, then: \`xcrun simctl install booted Ayna.app\`
+
+        ## Verification
+
+        \`\`\`
+        $(cat checksums.txt)
+        \`\`\`
+        EOF
+
+        # Remove heredoc indentation
+        sed -i '' 's/^        //' release_notes.md
+
+    - name: Check if pre-release
+      id: prerelease
+      run: |
+        TAG="${{ steps.version.outputs.tag }}"
+        if [[ "$TAG" =~ -(alpha|beta|rc|dev) ]]; then
+          echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Create or update GitHub release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -eo pipefail
+
+        TAG="${{ steps.version.outputs.tag }}"
+        PRERELEASE_FLAG=""
+        if [ "${{ steps.prerelease.outputs.is_prerelease }}" = "true" ]; then
+          PRERELEASE_FLAG="--prerelease"
+        fi
+
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          echo "Release $TAG already exists; uploading mobile assets to it"
+          gh release upload "$TAG" *.zip checksums.txt --clobber
+          gh release edit "$TAG" --notes-file release_notes.md
+        else
+          gh release create "$TAG" *.zip checksums.txt \
+            --title "$TAG" \
+            --notes-file release_notes.md \
+            $PRERELEASE_FLAG
+        fi
